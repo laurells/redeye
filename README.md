@@ -1,5 +1,9 @@
 # redeye
 
+[![CI](https://github.com/laurells/redeye/actions/workflows/ci.yml/badge.svg)](https://github.com/laurells/redeye/actions/workflows/ci.yml)
+[![npm version](https://img.shields.io/npm/v/redeye-breaker.svg)](https://www.npmjs.com/package/redeye-breaker)
+[![license](https://img.shields.io/npm/l/redeye-breaker.svg)](LICENSE)
+
 A circuit breaker for Node.js with an optional **distributed mode**: instead of tracking failures only in the memory of one process, breaker state lives in Redis (or any store you plug in), so a failure burst against a downstream dependency trips the breaker for *every* instance sharing that store — not just the one that saw the failures.
 
 When paired with `RedisStore`, redeye is a *reliable* distributed circuit breaker, not just a best-effort one: failure counting is atomic (a Redis Lua script, not a racy get-then-set), and recovery goes through a real half-open state where exactly one instance gets to try the dependency again while everyone else stays blocked — the two properties most local-only or naively-distributed circuit breakers skip.
