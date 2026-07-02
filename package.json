@@ -42,6 +42,14 @@
   ],
   "author": "Laurels Echichinwo",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/laurells/redeye.git"
+  },
+  "bugs": {
+    "url": "https://github.com/laurells/redeye/issues"
+  },
+  "homepage": "https://github.com/laurells/redeye#readme",
   "peerDependencies": {
     "ioredis": ">=5.0.0"
   },
