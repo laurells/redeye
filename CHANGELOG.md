@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-07-02
+
+### Added
+
+- CI: lint, unit tests, and build across Node 18/20/22, plus a separate job running the integration suite against a real Redis service container, on every push and pull request.
+- `CHANGELOG.md` and `CONTRIBUTING.md`.
+- CI / npm version / license badges in the README.
+
 ## [0.1.0] - 2026-07-02
 
 Initial release.
@@ -25,7 +33,7 @@ Initial release.
 - `onStateChange` and `onStoreError` hooks for observability.
 - Optional per-call `timeout` and `trialTimeout`, plus a local-mode monitor that force-releases a stale half-open trial claim if a call never settles.
 - Unit test suite (in-memory fakes) and an integration test suite that runs against real Redis via `docker compose up -d && npm run test:integration`.
-- CI: lint, unit tests, and build across Node 18/20/22, plus a separate job running the integration suite against a real Redis service container, on every push and pull request.
 
-[Unreleased]: https://github.com/laurells/redeye/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/laurells/redeye/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/laurells/redeye/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/laurells/redeye/releases/tag/v0.1.0
