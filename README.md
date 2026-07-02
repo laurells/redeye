@@ -158,6 +158,20 @@ If the store itself throws (Redis is down, times out, network partition, etc.), 
 
 Writes back to the store are **always** best-effort — a write failure is logged and reported via `onStoreError`, but never thrown, and never overrides the real result of a call that already happened.
 
+### Total coordination-layer outage (the store itself is down)
+
+The behavior above also describes what happens when the store is unreachable for *every* instance at once, not just one — there's no separate failover mechanism for that case. redeye doesn't promote a backup coordinator, doesn't elect a leader, and doesn't temporarily fall back to per-instance local tracking as a substitute. It's the same `failOpenOnStoreError` branch, just hit by the whole fleet simultaneously on every call instead of by one partitioned instance:
+
+- **`true` (default):** every instance independently lets every call through. This is not "each instance falls back to local-mode breaking" — it's "no breaking happens anywhere," fleet-wide, for as long as the outage lasts. You're trading breaker protection for availability of the guarded call itself.
+- **`false`:** every instance blocks every call with `StoreUnavailableError`, fleet-wide, for as long as the outage lasts — including requests that would have succeeded.
+
+A few things worth knowing about this specific case:
+
+- **Nothing is buffered or replayed.** Failures and successes that happen during the outage are never recorded anywhere (the write-back also fails and is swallowed the same way). Once the store comes back, the breaker has no memory of what happened while it was down — it doesn't "catch up."
+- **There's no back-off from hitting the store.** Every guarded call keeps trying `store.get()`/`store.set()` again for the entire outage; redeye doesn't stop calling out to a store it knows is down. If you're on `failOpenOnStoreError: false`, that means every request pays for a failed round trip before being rejected. Pair this with fail-fast client options (e.g. `ioredis`'s `maxRetriesPerRequest`, `enableOfflineQueue: false`) if you don't want calls queuing on the client's own reconnect logic during an extended outage — that's a client-level setting, not something redeye controls.
+- **Recovery is immediate and automatic, not staged.** The moment the store answers again, the very next call's read succeeds and the whole fleet converges back to shared state instantly. There's no warm-up period, cache to invalidate, or manual reset involved.
+- **High availability of the store itself is your responsibility, not redeye's.** If you want the coordination layer to survive an individual Redis node dying, that's Sentinel or Cluster, configured on the client you construct and pass to `RedisStore` — redeye has no opinion on it, it just calls whatever client you hand it. And per [Split-brain: what's prevented, and what isn't](#split-brain-whats-prevented-and-what-isnt), whatever failover consistency that setup provides (or doesn't) is inherited as-is — redeye adds no consensus layer of its own on top.
+
 ## Reliability model & limitations
 
 ### What redeye actually solves (with `RedisStore`, or any store implementing the matching optional methods)

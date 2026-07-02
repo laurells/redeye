@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - README: documented failover/split-brain tradeoffs in distributed mode — a new "Split-brain: what's prevented, and what isn't" section, plus three new numbered items in the reliability tradeoffs list covering partitioned-instance fail-open behavior, the rare `claimTrial`-error double-trial window, and inherited Redis replication/failover consistency.
+- README: documented total coordination-layer outage behavior — a new "Total coordination-layer outage (the store itself is down)" section distinguishing fleet-wide store unavailability from the single-partitioned-instance case, covering fail-open/fail-closed at fleet scale, the lack of buffering/replay or store back-off, and that store HA (Sentinel/Cluster) is the consumer's responsibility.
 
 ## [0.1.1] - 2026-07-02
 
