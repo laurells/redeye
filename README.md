@@ -9,7 +9,7 @@ When paired with `RedisStore`, redeye is a *reliable* distributed circuit breake
 ## Install
 
 ```bash
-npm install @laurels/redeye
+npm install redeye-breaker
 ```
 
 Redis support is an optional peer dependency — only needed if you use `RedisStore`:
@@ -23,7 +23,7 @@ npm install ioredis
 ### Local mode (default, no dependencies)
 
 ```ts
-import { CircuitBreaker } from '@laurels/redeye';
+import { CircuitBreaker } from 'redeye-breaker';
 
 const breaker = new CircuitBreaker({
   failureThreshold: 5,
@@ -62,8 +62,8 @@ Pick `consecutive` when you mainly care about clean outages, `errorRate` when th
 ### Distributed mode (Redis-backed, fully atomic)
 
 ```ts
-import { CircuitBreaker } from '@laurels/redeye';
-import { RedisStore } from '@laurels/redeye/redis-store';
+import { CircuitBreaker } from 'redeye-breaker';
+import { RedisStore } from 'redeye-breaker/redis-store';
 import Redis from 'ioredis';
 
 const redis = new Redis(process.env.REDIS_URL);
