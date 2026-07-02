@@ -202,6 +202,10 @@ docker compose down
 
 It connects to `REDIS_URL` (default `redis://localhost:6379`).
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). Changes are tracked in [CHANGELOG.md](CHANGELOG.md).
+
 ## License
 
 MIT
