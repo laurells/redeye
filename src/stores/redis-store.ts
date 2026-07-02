@@ -1,6 +1,28 @@
-import type { Redis } from 'ioredis';
+import type { Redis, Result } from 'ioredis';
+import { randomUUID } from 'node:crypto';
 import { Store } from '../store';
 import { CircuitBreakerState } from '../types';
+
+declare module 'ioredis' {
+  interface RedisCommander<Context> {
+    redeyeRecordFailure(
+      key: string,
+      ttlSeconds: number,
+      failureThreshold: number,
+      now: number,
+    ): Result<string, Context>;
+    redeyeRecordOutcome(
+      key: string,
+      decay: number,
+      isFailure: number,
+      minimumCalls: number,
+      errorRateThreshold: number,
+      ttlSeconds: number,
+      now: number,
+    ): Result<string, Context>;
+    redeyeReleaseTrial(key: string, token: string): Result<number, Context>;
+  }
+}
 
 /**
  * Atomically increments the stored failure count and decides `isOpen` in one
@@ -91,20 +113,45 @@ return cjson.encode(result)
 `;
 
 /**
+ * Compare-and-delete: releases a trial claim only if `token` still matches
+ * what's stored. Without this, releasing with a plain DEL can destroy a
+ * *different* instance's newer claim if the original trial outran its TTL
+ * and someone else has since claimed the key (see README limitation on
+ * trial-TTL expiry) — a stale release would otherwise cascade into an extra
+ * concurrent trial beyond the one that scenario already accepts by design.
+ */
+const RELEASE_TRIAL_SCRIPT = `
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('DEL', KEYS[1])
+else
+  return 0
+end
+`;
+
+/**
  * Redis-backed Store implementation. Import this from
  * `redeye/redis-store` so the core package has no hard dependency on
  * `ioredis` — only consumers who use RedisStore need it installed.
  *
  * Implements all three optional atomic capabilities (`recordFailureAtomic`
- * and `recordOutcomeAtomic` via Lua scripts, `claimTrial` via `SET ... NX`),
- * so breakers backed by RedisStore get exact counting and real single-trial
- * half-open behavior under both strategies instead of best-effort fallbacks.
+ * and `recordOutcomeAtomic` via Lua scripts, `claimTrial`/`releaseTrial` via
+ * a tokened `SET ... NX` and compare-and-delete), so breakers backed by
+ * RedisStore get exact counting and real single-trial half-open behavior
+ * under both strategies instead of best-effort fallbacks.
+ *
+ * Scripts are registered once per Redis client via `defineCommand`, so
+ * ioredis sends a cached script hash (`EVALSHA`) on every call instead of
+ * the full script body, with automatic fallback to `EVAL` if the script
+ * cache is ever flushed.
  */
 export class RedisStore implements Store {
   private readonly prefix: string;
 
   constructor(private readonly redis: Redis, options: { keyPrefix?: string } = {}) {
     this.prefix = options.keyPrefix ?? '';
+    redis.defineCommand('redeyeRecordFailure', { numberOfKeys: 1, lua: RECORD_FAILURE_SCRIPT });
+    redis.defineCommand('redeyeRecordOutcome', { numberOfKeys: 1, lua: RECORD_OUTCOME_SCRIPT });
+    redis.defineCommand('redeyeReleaseTrial', { numberOfKeys: 1, lua: RELEASE_TRIAL_SCRIPT });
   }
 
   async get<T>(key: string): Promise<T | null> {
@@ -125,14 +172,12 @@ export class RedisStore implements Store {
     key: string,
     opts: { ttlSeconds: number; failureThreshold: number; now: number },
   ): Promise<CircuitBreakerState> {
-    const raw = (await this.redis.eval(
-      RECORD_FAILURE_SCRIPT,
-      1,
+    const raw = await this.redis.redeyeRecordFailure(
       this.prefix + key,
       Math.max(1, Math.ceil(opts.ttlSeconds)),
       opts.failureThreshold,
       opts.now,
-    )) as string;
+    );
     return JSON.parse(raw) as CircuitBreakerState;
   }
 
@@ -140,9 +185,7 @@ export class RedisStore implements Store {
     key: string,
     opts: { success: boolean; decay: number; minimumCalls: number; errorRateThreshold: number; ttlSeconds: number; now: number },
   ): Promise<CircuitBreakerState & { openedNow: boolean }> {
-    const raw = (await this.redis.eval(
-      RECORD_OUTCOME_SCRIPT,
-      1,
+    const raw = await this.redis.redeyeRecordOutcome(
       this.prefix + key,
       opts.decay,
       opts.success ? 0 : 1,
@@ -150,12 +193,17 @@ export class RedisStore implements Store {
       opts.errorRateThreshold,
       Math.max(1, Math.ceil(opts.ttlSeconds)),
       opts.now,
-    )) as string;
+    );
     return JSON.parse(raw) as CircuitBreakerState & { openedNow: boolean };
   }
 
-  async claimTrial(key: string, ttlSeconds: number): Promise<boolean> {
-    const result = await this.redis.set(this.prefix + key, '1', 'EX', Math.max(1, Math.ceil(ttlSeconds)), 'NX');
-    return result === 'OK';
+  async claimTrial(key: string, ttlSeconds: number): Promise<string | null> {
+    const token = randomUUID();
+    const result = await this.redis.set(this.prefix + key, token, 'EX', Math.max(1, Math.ceil(ttlSeconds)), 'NX');
+    return result === 'OK' ? token : null;
+  }
+
+  async releaseTrial(key: string, token: string): Promise<void> {
+    await this.redis.redeyeReleaseTrial(this.prefix + key, token);
   }
 }
