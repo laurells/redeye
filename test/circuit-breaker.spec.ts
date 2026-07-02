@@ -231,6 +231,19 @@ describe('CircuitBreaker (store unavailable)', () => {
     failOpenBreaker.destroy();
     failClosedBreaker.destroy();
   });
+
+  it('canExecute warns once in distributed mode instead of silently returning a meaningless true', async () => {
+    const store = new InMemoryStore();
+    const logger = { warn: jest.fn(), log: jest.fn() };
+    const breaker = new CircuitBreaker({ store, logger });
+
+    expect(breaker.canExecute('op-a')).toBe(true);
+    expect(breaker.canExecute('op-b')).toBe(true);
+
+    const canExecuteWarnings = logger.warn.mock.calls.filter((call) => String(call[0]).includes('canExecute()'));
+    expect(canExecuteWarnings).toHaveLength(1);
+    breaker.destroy();
+  });
 });
 
 describe('CircuitBreaker (atomic distributed store)', () => {
@@ -282,6 +295,21 @@ describe('CircuitBreaker (atomic distributed store)', () => {
     const state = await breaker.getState('op');
     expect(state.isOpen).toBe(false);
     expect(state.openCount).toBe(0);
+    breaker.destroy();
+  });
+
+  it('fires onStateChange with half-open when a caller claims the trial slot via claimTrial', async () => {
+    const store = new AtomicInMemoryStore();
+    const onStateChange = jest.fn();
+    const breaker = new CircuitBreaker({ failureThreshold: 1, resetTimeout: 30, store, onStateChange });
+
+    await expect(breaker.execute('op', fail)).rejects.toThrow();
+    await new Promise((resolve) => setTimeout(resolve, 40));
+
+    await expect(breaker.execute('op', succeed)).resolves.toBe('ok');
+
+    const order = onStateChange.mock.calls.map((call) => call[0]);
+    expect(order).toEqual(['open', 'half-open', 'closed']);
     breaker.destroy();
   });
 
@@ -342,6 +370,23 @@ describe('CircuitBreaker (half-open, local mode)', () => {
 
     releaseTrial();
     await expect(trial).resolves.toBe('ok');
+    breaker.destroy();
+  });
+
+  it('fires onStateChange with half-open when a caller claims the trial slot', async () => {
+    const onStateChange = jest.fn();
+    const breaker = new CircuitBreaker({ failureThreshold: 1, resetTimeout: 30, onStateChange });
+
+    await expect(breaker.execute('op', fail)).rejects.toThrow();
+    expect(onStateChange).toHaveBeenCalledWith('open', 'op');
+    await new Promise((resolve) => setTimeout(resolve, 40));
+
+    await expect(breaker.execute('op', succeed)).resolves.toBe('ok');
+    expect(onStateChange).toHaveBeenCalledWith('half-open', 'op');
+    expect(onStateChange).toHaveBeenCalledWith('closed', 'op');
+
+    const order = onStateChange.mock.calls.map((call) => call[0]);
+    expect(order).toEqual(['open', 'half-open', 'closed']);
     breaker.destroy();
   });
 });
