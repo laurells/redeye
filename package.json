@@ -1,0 +1,64 @@
+{
+  "name": "@laurels/redeye",
+  "version": "0.1.0",
+  "publishConfig": {
+    "access": "public"
+  },
+  "description": "A circuit breaker for Node.js with an optional Redis-backed distributed mode, so breaker state can be shared across multiple app instances instead of being tracked per-process.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./redis-store": {
+      "types": "./dist/stores/redis-store.d.ts",
+      "default": "./dist/stores/redis-store.js"
+    }
+  },
+  "typesVersions": {
+    "*": {
+      "redis-store": ["dist/stores/redis-store.d.ts"]
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "jest",
+    "test:integration": "jest --config jest.integration.config.js",
+    "lint": "tsc --noEmit",
+    "prepublishOnly": "npm run lint && npm run test && npm run build"
+  },
+  "keywords": [
+    "circuit-breaker",
+    "resilience",
+    "redis",
+    "distributed-systems",
+    "fault-tolerance",
+    "microservices"
+  ],
+  "author": "Laurels Echichinwo",
+  "license": "MIT",
+  "peerDependencies": {
+    "ioredis": ">=5.0.0"
+  },
+  "peerDependenciesMeta": {
+    "ioredis": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/jest": "^29.5.12",
+    "@types/node": "^20.11.0",
+    "ioredis": "^5.4.1",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.1.2",
+    "typescript": "^5.4.5"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

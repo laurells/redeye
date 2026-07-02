@@ -1,0 +1,203 @@
+# redeye
+
+A circuit breaker for Node.js with an optional **distributed mode**: instead of tracking failures only in the memory of one process, breaker state lives in Redis (or any store you plug in), so a failure burst against a downstream dependency trips the breaker for *every* instance sharing that store — not just the one that saw the failures.
+
+When paired with `RedisStore`, redeye is a *reliable* distributed circuit breaker, not just a best-effort one: failure counting is atomic (a Redis Lua script, not a racy get-then-set), and recovery goes through a real half-open state where exactly one instance gets to try the dependency again while everyone else stays blocked — the two properties most local-only or naively-distributed circuit breakers skip.
+
+**Read [Reliability model & limitations](#reliability-model--limitations) before using this for anything load-bearing.** A handful of tradeoffs are fundamental to any distributed system (trusting your store, tolerating clock skew) and no library can engineer those away — that section is honest about exactly which ones those are, and which ones redeye actually solves.
+
+## Install
+
+```bash
+npm install @laurels/redeye
+```
+
+Redis support is an optional peer dependency — only needed if you use `RedisStore`:
+
+```bash
+npm install ioredis
+```
+
+## Usage
+
+### Local mode (default, no dependencies)
+
+```ts
+import { CircuitBreaker } from '@laurels/redeye';
+
+const breaker = new CircuitBreaker({
+  failureThreshold: 5,
+  resetTimeout: 60_000,
+});
+
+const result = await breaker.execute('payment-gateway', () => callPaymentGateway());
+```
+
+Local mode gets real half-open (single in-flight trial) and backoff+jitter too — it's single-process, so there's no atomicity concern to begin with.
+
+### Two tripping strategies
+
+```ts
+// Default: trips after N failures in a row. Good for hard drops (a
+// dependency going fully down). Resets to zero on any success, so it
+// will not catch a dependency that's merely degraded.
+new CircuitBreaker({ strategy: 'consecutive', failureThreshold: 5 });
+
+// Trips when an EWMA-smoothed failure rate crosses a threshold, once
+// enough samples have been seen. Catches flapping/degrading dependencies
+// a consecutive-failure breaker structurally cannot: e.g. an API that
+// fails 4 out of every 5 requests (80% failure rate) never fails twice
+// in a row in that exact pattern, so 'consecutive' never trips — but
+// 'errorRate' does, because it looks at the rate, not the streak.
+new CircuitBreaker({
+  strategy: 'errorRate',
+  errorRateThreshold: 0.5, // open at >= 50% failure rate
+  minimumCalls: 10,        // ...but only once we've seen at least 10 calls
+  errorRateDecay: 0.9,     // how much weight recent calls get vs. history
+});
+```
+
+Pick `consecutive` when you mainly care about clean outages, `errorRate` when the dependency is more likely to degrade than to go fully dark. You can run two breaker *instances* with different strategies over the same logical operation for both kinds of protection at once — in distributed mode, give each its own `RedisStore` `keyPrefix` (or the two breakers will read/write the same Redis key with incompatible state shapes and corrupt each other).
+
+### Distributed mode (Redis-backed, fully atomic)
+
+```ts
+import { CircuitBreaker } from '@laurels/redeye';
+import { RedisStore } from '@laurels/redeye/redis-store';
+import Redis from 'ioredis';
+
+const redis = new Redis(process.env.REDIS_URL);
+const store = new RedisStore(redis, { keyPrefix: 'myapp:' });
+
+const breaker = new CircuitBreaker({
+  failureThreshold: 5,
+  resetTimeout: 60_000,
+  store, // <- presence of a store is what enables distributed mode
+  onStateChange: (state, operation) => {
+    console.warn(`circuit breaker for ${operation} is now ${state}`);
+  },
+  onStoreError: (error, operation) => {
+    // Redis unreachable, timed out, etc. — see "Store unavailability" below.
+    console.error(`circuit breaker store error for ${operation}`, error);
+  },
+});
+
+await breaker.execute('payment-gateway', () => callPaymentGateway());
+```
+
+Every process pointed at the same Redis instance (and using the same operation name / key prefix) shares breaker state, with atomic counting and single-trial recovery.
+
+### Bring your own store
+
+`RedisStore` implements a `Store` interface with two required methods and three *optional* ones:
+
+```ts
+export interface Store {
+  get<T>(key: string): Promise<T | null>;
+  set<T>(key: string, value: T, ttlSeconds: number): Promise<void>;
+  del(key: string): Promise<void>;
+
+  // Optional — implement these for the reliability guarantees below.
+  // Without them, redeye falls back to best-effort semantics and logs a
+  // one-time warning telling you exactly what's degraded.
+  recordFailureAtomic?(key: string, opts: { ttlSeconds: number; failureThreshold: number; now: number }): Promise<CircuitBreakerState>;
+  recordOutcomeAtomic?(key: string, opts: { success: boolean; decay: number; minimumCalls: number; errorRateThreshold: number; ttlSeconds: number; now: number }): Promise<CircuitBreakerState & { openedNow: boolean }>;
+  claimTrial?(key: string, ttlSeconds: number): Promise<boolean>;
+}
+```
+
+- `recordFailureAtomic` (`strategy: 'consecutive'`) should increment the failure count and decide `isOpen` in one atomic round trip (a Lua script in Redis, a conditional update in DynamoDB, etc.).
+- `recordOutcomeAtomic` (`strategy: 'errorRate'`) should fold one call's outcome into the EWMA rate and decide `isOpen` in one atomic round trip — called on every closed-phase call, not just failures.
+- `claimTrial` should be a conditional "create if absent" write (`SET key val NX EX ttl` in Redis) — it's what makes half-open recovery exclusive to one caller instead of a free-for-all.
+
+Implement the two required methods against Memcached, DynamoDB, your own cache wrapper, etc., and you have a working (best-effort) distributed breaker. Add the optional methods relevant to the strategy you use when that store supports a real atomic increment and a real conditional write, and you get the full reliability guarantees.
+
+## API
+
+- `execute(operation, fn)` — runs `fn` if the breaker allows it (closed, or this call won the half-open trial); throws immediately without calling `fn` otherwise. Records the outcome automatically.
+- `canExecute(operation)` — synchronous, read-only, best-effort check. **Always returns `true` in distributed mode** (it can't await the store) — use `canExecuteAsync` there. Never claims a trial slot.
+- `canExecuteAsync(operation)` — async, store-aware, read-only check. Honors `failOpenOnStoreError`. Never claims a trial slot — see the TOCTOU note below.
+- `recordFailure(operation)` / `recordSuccess(operation)` — manually record an outcome without routing the call through `execute`. Note: these bypass the half-open trial-claim mechanism entirely (see [limitations](#reliability-model--limitations)) — prefer `execute`.
+- `getState(operation)` — returns `{ failures, lastFailure, isOpen, openCount, errorRate, sampleCount }`. `openCount` is how many consecutive half-open trials have failed since the breaker last fully closed (drives backoff). `errorRate`/`sampleCount` are only meaningful under `strategy: 'errorRate'`.
+- `getMetrics(operation)` / `getAllMetrics()` — per-instance counters: `{ totalCalls, totalSuccesses, totalFailures, totalRejections, totalStoreErrors }`.
+- `reset(operation)` — manually closes the breaker for an operation.
+- `destroy()` — stops the internal monitor interval. Call this when a breaker instance is no longer needed (e.g. in tests, or on service shutdown) to avoid leaking a timer.
+
+## Options
+
+| Option | Default | Description |
+|---|---|---|
+| `strategy` | `'consecutive'` | `'consecutive'` or `'errorRate'` — see [Two tripping strategies](#two-tripping-strategies) |
+| `failureThreshold` | `5` | `'consecutive'` only: failures in a row before the breaker opens |
+| `errorRateThreshold` | `0.5` | `'errorRate'` only: failure rate (0-1) at or above which the breaker opens |
+| `minimumCalls` | `10` | `'errorRate'` only: minimum samples before the rate can trip the breaker |
+| `errorRateDecay` | `0.9` | `'errorRate'` only: EWMA decay factor — closer to 1 weighs history more heavily |
+| `resetTimeout` | `60000` | ms to stay open before allowing a half-open trial |
+| `backoffMultiplier` | `2` | Multiplies `resetTimeout` on each failed trial (`1` disables backoff) |
+| `maxResetTimeout` | `resetTimeout * 8` | Ceiling for the backed-off reset timeout |
+| `jitter` | `0.1` | Randomizes the effective reset timeout by ±this fraction, so instances don't all retry in lockstep |
+| `trialTimeout` | `min(timeout ?? 10000, resetTimeout)` | Max ms a claimed half-open trial may run before its claim is released/expires |
+| `monitorInterval` | `5000` | ms between local-mode sweeps for a trial that never settled (safety net) |
+| `timeout` | none | optional per-call timeout in ms |
+| `store` | none | enables distributed mode when provided |
+| `failOpenOnStoreError` | `true` | see [Store unavailability](#store-unavailability-fail-open-vs-fail-closed) |
+| `onStateChange` | none | `(state: 'open' \| 'closed', operation: string) => void` |
+| `onStoreError` | none | `(error: unknown, operation: string) => void` — fired whenever a store read/write fails, in addition to being logged |
+| `logger` | no-op | `{ warn(msg), log(msg) }` — plug in your own logger |
+
+### Store unavailability: fail-open vs fail-closed
+
+If the store itself throws (Redis is down, times out, network partition, etc.), redeye does **not** treat that the same as the protected operation failing — it's a distinct condition, controlled by `failOpenOnStoreError`:
+
+- **`true` (default)** — treat the breaker as closed and let the call through. A store outage degrades you to "no circuit-breaker protection," not "every call blocked."
+- **`false`** — throw `StoreUnavailableError` (exported) without calling the wrapped function at all. Appropriate when the protected operation is expensive, dangerous to retry blindly, or would itself add load to whatever's already causing the outage.
+
+Writes back to the store are **always** best-effort — a write failure is logged and reported via `onStoreError`, but never thrown, and never overrides the real result of a call that already happened.
+
+## Reliability model & limitations
+
+### What redeye actually solves (with `RedisStore`, or any store implementing the matching optional methods)
+
+- **Exact counting under concurrent failure, for both strategies.** `recordFailureAtomic` (consecutive) and `recordOutcomeAtomic` (errorRate) each run as a single Lua script inside Redis's single-threaded execution — two instances updating at the same instant cannot race and lose an update the way a plain get-then-set would.
+- **Catches flapping, not just hard drops.** `strategy: 'errorRate'` trips on a smoothed failure *rate* once enough samples are seen, so a dependency that succeeds 1 in 5 requests (an 80% failure rate) still trips the breaker even though it never fails N times consecutively — a case `'consecutive'` structurally cannot catch, by design (see [Two tripping strategies](#two-tripping-strategies)).
+- **Real half-open, single-trial recovery.** When the reset window elapses, callers don't all rush in — one caller atomically claims the trial slot (`claimTrial`, a conditional write) and the rest stay blocked (`Circuit breaker is open`) until that trial resolves. This is the classic Hystrix-style half-open state, not "everyone tries at once." Applies to both strategies.
+- **Exponential backoff with jitter.** A dependency that keeps failing its trial is retried less often each time (`resetTimeout * backoffMultiplier ^ openCount`, capped at `maxResetTimeout`), and the exact retry moment is jittered per-instance so a cluster doesn't hammer a recovering dependency in lockstep.
+- **No hard dependency on precise TTL timing for correctness.** The gating decision is based on elapsed time since the last recorded failure, not "did the key vanish yet" — the store's TTL is a generous safety-net for cleanup, not the primary mechanism. (Early eviction is still possible — see below — but it degrades gracefully instead of being load-bearing.)
+- **Store outages are a distinct, handled condition**, not silently misattributed as the protected operation failing (see fail-open/fail-closed above).
+- **Observability**: per-instance call/success/failure/rejection/store-error counters via `getMetrics`, plus `onStateChange` and `onStoreError` hooks.
+
+If your store *doesn't* implement the atomic method your chosen strategy needs (`recordFailureAtomic` or `recordOutcomeAtomic`) or `claimTrial`, redeye logs a one-time warning per missing capability and falls back to a non-atomic get-then-set — it still works, just without the atomicity/exclusivity guarantee for that piece.
+
+### What's still a fundamental tradeoff, not a bug
+
+These are true of any distributed circuit breaker, rate limiter, or lock built on a shared store — not gaps specific to redeye:
+
+1. **Correctness depends on trusting your store.** If Redis evicts a breaker key early under memory pressure (e.g. `maxmemory-policy allkeys-lru` with `circuit_breaker:*` competing for space with everything else), the breaker can reset earlier than intended. Mitigate by giving circuit-breaker keys their own keyspace/DB with a policy that doesn't evict them, or by monitoring `onStoreError` and Redis memory pressure directly. This is not fixable in-library — it's an operational configuration matter.
+2. **Distributed timing is sensitive to clock skew.** Backoff and jitter windows are computed by comparing each instance's local `Date.now()` against a `lastFailure` timestamp written by whichever instance recorded it. With reasonably synchronized clocks (standard NTP) this is a non-issue; on a fleet with significant clock drift, instances can disagree by that drift amount about exactly when a trial becomes eligible. This affects *timing* only — the half-open claim mechanism (`claimTrial`) still guarantees exactly one trial runs regardless of skew, so skew cannot cause a thundering herd, only a slightly early or late trial attempt.
+3. **`recordFailure`/`recordSuccess`/`canExecuteAsync` don't participate in trial claiming.** Only `execute()` claims and releases the half-open trial slot. If you build your own call flow around the manual API instead of `execute()`, you lose the single-trial guarantee and get the old "everyone retries once elapsed" behavior for that flow. Prefer `execute()`.
+4. **One strategy/threshold/backoff policy per breaker instance**, applied uniformly to every `operation` string passed to it. Use separate `CircuitBreaker` instances for dependencies that need different policies — and separate `RedisStore` key prefixes if two breakers share an operation name with different strategies (their state shapes are incompatible and will corrupt each other under the same key).
+5. **Local mode has no cross-restart persistence**, by design — it's explicitly the zero-dependency option. Use distributed mode if breaker state needs to survive a process restart.
+6. **Metrics are per-instance**, not automatically aggregated across your fleet — the same as any Prometheus counter you'd scrape per-pod. Aggregate them in your own metrics backend if you need a fleet-wide view.
+7. **`errorRate` is EWMA-smoothed, not a precise sliding window.** It approximates "failure rate over roughly the last ~`1/(1-decay)` calls," not an exact count over an exact window — good enough to catch flapping dependencies, but the exact trip point for a given call sequence is a function of the decay math, not literally "N of the last M calls."
+
+### What redeye deliberately does not try to be
+
+redeye is scoped to "circuit breaking, done correctly, optionally shared via a store." It does not do retries, bulkheading, or request hedging. If you need those, compose redeye with a separate retry library, and think carefully about ordering: retries should generally happen *inside* what the breaker counts as a single call, not wrapped around it — otherwise a retry storm can trip the breaker faster than intended, or mask real failures from it entirely.
+
+## Testing
+
+`npm test` runs the unit suite (`test/*.spec.ts`) against in-memory fakes — no external services required.
+
+`npm run test:integration` runs `test/*.integration.spec.ts` against a real Redis, exercising `RedisStore`'s actual Lua scripts and `SET ... NX` trial-claim logic instead of a reimplementation of them. Start Redis first:
+
+```sh
+docker compose up -d
+npm run test:integration
+docker compose down
+```
+
+It connects to `REDIS_URL` (default `redis://localhost:6379`).
+
+## License
+
+MIT
