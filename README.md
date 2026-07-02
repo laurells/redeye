@@ -172,6 +172,20 @@ Writes back to the store are **always** best-effort — a write failure is logge
 
 If your store *doesn't* implement the atomic method your chosen strategy needs (`recordFailureAtomic` or `recordOutcomeAtomic`) or `claimTrial`, redeye logs a one-time warning per missing capability and falls back to a non-atomic get-then-set — it still works, just without the atomicity/exclusivity guarantee for that piece.
 
+### Split-brain: what's prevented, and what isn't
+
+There's no split-brain among your app instances in the classic sense, because instances never hold independent authoritative state to disagree over — every instance reads the store fresh before every single decision (`gateDistributed`) instead of trusting a locally cached opinion. The store is the only "brain"; instances are just readers/writers of it. Two mechanisms enforce agreement on the common path:
+
+- **Atomic writes.** `recordFailureAtomic`/`recordOutcomeAtomic` run as one Lua script — GET, decode, increment, decide, SET — inside Redis's single-threaded execution, so two instances failing at the same instant can't both read the same count and both write the same increment.
+- **Exclusive trial claim.** `claimTrial` is a `SET ... NX`, which Redis resolves atomically, so exactly one instance ever runs the half-open recovery probe — never two instances simultaneously deciding they're the one testing recovery.
+
+So the design doesn't eliminate split-brain so much as route around it: it pushes the single-arbiter requirement onto the store and never lets an instance act on stale local state instead of asking the store. That said, there are real, narrow windows where instances *can* still disagree — each one is a deliberate availability-over-consistency choice, not a hidden gap:
+
+- **An instance partitioned from the store fails open independently** (item 8 below) — during the partition, that one instance's view of the breaker can genuinely diverge from the rest of the fleet's.
+- **A `claimTrial` error can rarely produce two "winners"** (item 9 below) — a narrow window traded for never permanently wedging the breaker open.
+- **The store's own replication/failover consistency is inherited, not solved** (item 10 below) — this library adds no consensus layer on top of whatever your Redis deployment already guarantees.
+- **Clock skew causes timing disagreement, not state disagreement** (item 2 below) — it can shift exactly when a trial becomes eligible, but it cannot cause a double-trial, since that's arbitrated by the store, not by comparing clocks.
+
 ### What's still a fundamental tradeoff, not a bug
 
 These are true of any distributed circuit breaker, rate limiter, or lock built on a shared store — not gaps specific to redeye:
@@ -183,6 +197,9 @@ These are true of any distributed circuit breaker, rate limiter, or lock built o
 5. **Local mode has no cross-restart persistence**, by design — it's explicitly the zero-dependency option. Use distributed mode if breaker state needs to survive a process restart.
 6. **Metrics are per-instance**, not automatically aggregated across your fleet — the same as any Prometheus counter you'd scrape per-pod. Aggregate them in your own metrics backend if you need a fleet-wide view.
 7. **`errorRate` is EWMA-smoothed, not a precise sliding window.** It approximates "failure rate over roughly the last ~`1/(1-decay)` calls," not an exact count over an exact window — good enough to catch flapping dependencies, but the exact trip point for a given call sequence is a function of the decay math, not literally "N of the last M calls."
+8. **A partitioned instance fails open on its own, independently of the rest of the fleet.** If an instance's own call to the store errors (that instance can't reach Redis, but others can), it doesn't consult anyone else — it applies `failOpenOnStoreError` locally (default `true`). For the duration of that partition, the isolated instance treats the breaker as closed while the rest of the fleet, still able to reach the store, correctly sees it open. This is scoped to exactly the partitioned instance for exactly the duration of the partition, and it's a deliberate choice: favoring that one instance staying available over it blocking calls based on a store it can't even confirm the state of.
+9. **A `claimTrial` error can rarely let two instances both believe they won the trial.** If the `claimTrial` call itself throws (not "no key", an actual error), the gate does not block the caller — it fails open on the trial too (`allowed: true, isTrial: true`), because refusing here would mean a single store blip at exactly the wrong moment could permanently wedge the breaker open (no one could ever claim the trial again). If two instances hit that specific error in the same narrow window, both can proceed with a trial call. This trades a rare double-trial for never risking permanent lockout.
+10. **`RedisStore` inherits Redis's own replication/failover consistency — it doesn't add a consensus layer on top.** A single Redis instance has nothing to split-brain over. But if you run Sentinel or Cluster behind it, a failover with asynchronous replication can lose the last few writes, and reading from a lagging replica can return stale state. `RedisStore` doesn't issue `WAIT` or otherwise wait for replica acknowledgment — it trusts whatever consistency guarantees your Redis deployment itself provides.
 
 ### What redeye deliberately does not try to be
 
