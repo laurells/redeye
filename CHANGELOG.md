@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-03
+
 **Breaking changes in this 0.x minor** (both allowed under semver's pre-1.0 rules, neither is a patch-level change):
 1. `CircuitState` widened to include `'half-open'` — a compile-time break for exhaustive `switch`/`if` over the type, even though additive at runtime. See the `Added` entry below.
 2. `Store.claimTrial`'s return type changed from `Promise<boolean>` to `Promise<string | null>`, and `Store` gained an optional `releaseTrial(key, token)`. Only relevant if you have a custom `Store` implementation (`RedisStore` is already updated). See the `Fixed` entry below.
@@ -66,6 +68,7 @@ Initial release.
 - Optional per-call `timeout` and `trialTimeout`, plus a local-mode monitor that force-releases a stale half-open trial claim if a call never settles.
 - Unit test suite (in-memory fakes) and an integration test suite that runs against real Redis via `docker compose up -d && npm run test:integration`.
 
-[Unreleased]: https://github.com/laurells/redeye/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/laurells/redeye/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/laurells/redeye/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/laurells/redeye/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/laurells/redeye/releases/tag/v0.1.0
