@@ -7,10 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `CircuitState` (and `onStateChange`) now includes `'half-open'`, fired exactly when a caller claims the single half-open trial slot, in both local and distributed mode. Previously only `'open'`/`'closed'` were observable, so entering half-open recovery was invisible to consumers of the hook.
+- `canExecute()` now logs a one-time warning the first time it's called in distributed mode, pointing callers at `canExecuteAsync()` — it always returned `true` there (documented), but silently.
+
+### Fixed
+
+- Distributed mode now fires `onStateChange('closed', operation)` when a successful half-open trial closes the breaker. This was a pre-existing gap: `reset()` already fired `'closed'` correctly on a real open→closed transition, but the `execute()`-driven successful-trial-close path never did, so distributed-mode consumers had no way to observe recovery via the hook.
+
 ### Changed
 
 - README: documented failover/split-brain tradeoffs in distributed mode — a new "Split-brain: what's prevented, and what isn't" section, plus three new numbered items in the reliability tradeoffs list covering partitioned-instance fail-open behavior, the rare `claimTrial`-error double-trial window, and inherited Redis replication/failover consistency.
 - README: documented total coordination-layer outage behavior — a new "Total coordination-layer outage (the store itself is down)" section distinguishing fleet-wide store unavailability from the single-partitioned-instance case, covering fail-open/fail-closed at fleet scale, the lack of buffering/replay or store back-off, and that store HA (Sentinel/Cluster) is the consumer's responsibility.
+- README: added a "Local mode vs. distributed mode: which do you need?" decision guide, documented `RedisStore`'s default key format/prefix, clarified that a single successful trial fully closes the breaker (no N-consecutive-successes support), added the previously-missing per-call latency/Redis-load tradeoff as item 1 in the reliability tradeoffs list (renumbering the rest), and trimmed the "Total coordination-layer outage" section for length.
 
 ## [0.1.1] - 2026-07-02
 

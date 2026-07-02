@@ -1,7 +1,7 @@
 import { Store } from './store';
 import { CircuitBreakerState, CircuitMetrics, CLOSED_STATE, emptyMetrics } from './types';
 
-export type CircuitState = 'closed' | 'open';
+export type CircuitState = 'closed' | 'open' | 'half-open';
 
 export interface BreakerLogger {
   warn(message: string): void;
@@ -156,6 +156,7 @@ export class CircuitBreaker {
 
   private readonly distributed: boolean;
   private readonly warnedCapabilities = new Set<string>();
+  private warnedCanExecuteInDistributedMode = false;
   private readonly metrics = new Map<string, CircuitMetrics>();
 
   // local mode state
@@ -213,7 +214,16 @@ export class CircuitBreaker {
    * `true` — use `canExecuteAsync` there.
    */
   canExecute(operation: string): boolean {
-    return this.distributed ? true : this.peekLocalGate(operation);
+    if (this.distributed) {
+      if (!this.warnedCanExecuteInDistributedMode) {
+        this.warnedCanExecuteInDistributedMode = true;
+        this.options.logger.warn(
+          'canExecute() always returns true in distributed mode (it cannot await the store) and does not reflect real breaker state; use canExecuteAsync() instead.',
+        );
+      }
+      return true;
+    }
+    return this.peekLocalGate(operation);
   }
 
   /**
@@ -410,16 +420,19 @@ export class CircuitBreaker {
     if (this.options.store!.claimTrial) {
       try {
         const claimed = await this.options.store!.claimTrial(this.trialKey(operation), this.trialTtlSeconds());
+        if (claimed) this.options.onStateChange?.('half-open', operation);
         return { allowed: claimed, isTrial: claimed };
       } catch (error) {
         this.reportStoreError(error, operation);
         if (!this.options.failOpenOnStoreError) throw new StoreUnavailableError(operation, error);
         // Can't confirm exclusivity — fail open on the trial itself rather than deadlocking forever.
+        this.options.onStateChange?.('half-open', operation);
         return { allowed: true, isTrial: true };
       }
     }
 
     this.warnMissingCapability('claimTrial');
+    this.options.onStateChange?.('half-open', operation);
     return { allowed: true, isTrial: true };
   }
 
@@ -439,6 +452,7 @@ export class CircuitBreaker {
       if (gate.isTrial) {
         await this.closeDistributed(operation);
         await this.safeDelTrial(operation);
+        this.options.onStateChange?.('closed', operation);
       } else if (this.options.strategy === 'errorRate') {
         await this.recordOutcomeDistributed(operation, true);
       } else {
@@ -640,6 +654,7 @@ export class CircuitBreaker {
 
     this.trialInProgress.add(operation);
     this.trialClaimedAt.set(operation, Date.now());
+    this.options.onStateChange?.('half-open', operation);
     return { allowed: true, isTrial: true };
   }
 
