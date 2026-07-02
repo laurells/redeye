@@ -104,7 +104,7 @@ Every process pointed at the same Redis instance (and using the same operation n
 
 ### Bring your own store
 
-`RedisStore` implements a `Store` interface with two required methods and three *optional* ones:
+`RedisStore` implements a `Store` interface with two required methods and four *optional* ones:
 
 ```ts
 export interface Store {
@@ -117,13 +117,15 @@ export interface Store {
   // one-time warning telling you exactly what's degraded.
   recordFailureAtomic?(key: string, opts: { ttlSeconds: number; failureThreshold: number; now: number }): Promise<CircuitBreakerState>;
   recordOutcomeAtomic?(key: string, opts: { success: boolean; decay: number; minimumCalls: number; errorRateThreshold: number; ttlSeconds: number; now: number }): Promise<CircuitBreakerState & { openedNow: boolean }>;
-  claimTrial?(key: string, ttlSeconds: number): Promise<boolean>;
+  claimTrial?(key: string, ttlSeconds: number): Promise<string | null>;
+  releaseTrial?(key: string, token: string): Promise<void>;
 }
 ```
 
 - `recordFailureAtomic` (`strategy: 'consecutive'`) should increment the failure count and decide `isOpen` in one atomic round trip (a Lua script in Redis, a conditional update in DynamoDB, etc.).
 - `recordOutcomeAtomic` (`strategy: 'errorRate'`) should fold one call's outcome into the EWMA rate and decide `isOpen` in one atomic round trip — called on every closed-phase call, not just failures.
-- `claimTrial` should be a conditional "create if absent" write (`SET key val NX EX ttl` in Redis) — it's what makes half-open recovery exclusive to one caller instead of a free-for-all.
+- `claimTrial` should be a conditional "create if absent" write (`SET key token NX EX ttl` in Redis, with `token` a fresh unique value per call, e.g. a UUID) — it's what makes half-open recovery exclusive to one caller instead of a free-for-all. Return the token you wrote if this call won the claim, or `null` if the key was already taken.
+- `releaseTrial` should be a compare-and-delete (`if GET key == token then DEL key` in Redis, a conditional delete elsewhere), not an unconditional delete. This is what stops a trial that outran its TTL (see [item 11](#whats-still-a-fundamental-tradeoff-not-a-bug)) from deleting a *different* instance's newer claim on the same key when it finally gets around to releasing its own now-stale one. If omitted (or if a call has no confirmed ownership token to release at all — e.g. `claimTrial` itself errored), redeye logs a one-time warning and leaves the claim for its TTL to expire naturally, rather than risk an unconditional delete that could destroy a claim it never confirmed was its own.
 
 Implement the two required methods against Memcached, DynamoDB, your own cache wrapper, etc., and you have a working (best-effort) distributed breaker. Add the optional methods relevant to the strategy you use when that store supports a real atomic increment and a real conditional write, and you get the full reliability guarantees.
 
@@ -137,6 +139,8 @@ Implement the two required methods against Memcached, DynamoDB, your own cache w
 - `getMetrics(operation)` / `getAllMetrics()` — per-instance counters: `{ totalCalls, totalSuccesses, totalFailures, totalRejections, totalStoreErrors }`.
 - `reset(operation)` — manually closes the breaker for an operation.
 - `destroy()` — stops the internal monitor interval. Call this when a breaker instance is no longer needed (e.g. in tests, or on service shutdown) to avoid leaking a timer.
+
+`operation` should be a small, fixed set of names (`'payment-gateway'`, `'fraud-api'`, one per dependency) — not something you interpolate per-request values into (a tenant ID, a URL, a user ID). Every distinct `operation` string gets its own entry in several per-instance maps (metrics, local-mode failure/backoff state, an internal jitter cache) that are never evicted, so a dynamic operation name is an unbounded memory leak, the same footgun as labeling a Prometheus metric with a high-cardinality value.
 
 ## Options
 
@@ -156,7 +160,7 @@ Implement the two required methods against Memcached, DynamoDB, your own cache w
 | `timeout` | none | optional per-call timeout in ms |
 | `store` | none | enables distributed mode when provided |
 | `failOpenOnStoreError` | `true` | see [Store unavailability](#store-unavailability-fail-open-vs-fail-closed) |
-| `onStateChange` | none | `(state: 'open' \| 'half-open' \| 'closed', operation: string) => void` — `'half-open'` fires exactly when a caller claims the single half-open trial slot |
+| `onStateChange` | none | `(state: 'open' \| 'half-open' \| 'closed', operation: string) => void` — `'half-open'` fires exactly when a caller claims the single half-open trial slot. In distributed mode this is a per-process callback, not a fleet-wide broadcast — see [Observability](#what-redeye-actually-solves-with-redisstore-or-any-store-implementing-the-matching-optional-methods) below for which instance actually sees it. |
 | `onStoreError` | none | `(error: unknown, operation: string) => void` — fired whenever a store read/write fails, in addition to being logged |
 | `logger` | no-op | `{ warn(msg), log(msg) }` — plug in your own logger |
 
@@ -190,7 +194,7 @@ High availability of the store itself (Sentinel, Cluster) is your responsibility
 - **Exponential backoff with jitter.** A dependency that keeps failing its trial is retried less often each time (`resetTimeout * backoffMultiplier ^ openCount`, capped at `maxResetTimeout`), and the exact retry moment is jittered per-instance so a cluster doesn't hammer a recovering dependency in lockstep.
 - **No hard dependency on precise TTL timing for correctness.** The gating decision is based on elapsed time since the last recorded failure, not "did the key vanish yet" — the store's TTL is a generous safety-net for cleanup, not the primary mechanism. (Early eviction is still possible — see below — but it degrades gracefully instead of being load-bearing.)
 - **Store outages are a distinct, handled condition**, not silently misattributed as the protected operation failing (see fail-open/fail-closed above).
-- **Observability**: per-instance call/success/failure/rejection/store-error counters via `getMetrics`, plus `onStateChange` and `onStoreError` hooks.
+- **Observability**: per-instance call/success/failure/rejection/store-error counters via `getMetrics`, plus `onStateChange` and `onStoreError` hooks. In distributed mode, `onStateChange` is invoked locally by whichever instance's own call happens to trigger a given transition — not broadcast to the rest of the fleet. Concretely: `'open'` fires only on the instance whose write is the one that crosses the threshold (or whose failed trial reopens it); `'half-open'` fires only on the instance that wins the trial claim; `'closed'` fires only on the instance that closes it (via a successful trial, or a manual `recordSuccess()`/`reset()` call). Every other instance sharing that operation still sees the new state reflected in their own gating decisions immediately — they just never get their own `onStateChange` call for a transition they didn't personally cause. If you need a fleet-wide notification (e.g. to page on-call once, not once per instance that happens to notice), de-duplicate downstream of the hook, or drive alerting off the store directly instead.
 
 If your store *doesn't* implement the atomic method your chosen strategy needs (`recordFailureAtomic` or `recordOutcomeAtomic`) or `claimTrial`, redeye logs a one-time warning per missing capability and falls back to a non-atomic get-then-set — it still works, just without the atomicity/exclusivity guarantee for that piece.
 
@@ -205,7 +209,8 @@ So the design doesn't eliminate split-brain so much as route around it: it pushe
 
 - **An instance partitioned from the store fails open independently** (item 9 below) — during the partition, that one instance's view of the breaker can genuinely diverge from the rest of the fleet's.
 - **A `claimTrial` error can rarely produce two "winners"** (item 10 below) — a narrow window traded for never permanently wedging the breaker open.
-- **The store's own replication/failover consistency is inherited, not solved** (item 11 below) — this library adds no consensus layer on top of whatever your Redis deployment already guarantees.
+- **A slow trial outliving its claim's TTL is the *more likely* way to get two concurrent trials** (item 11 below) — routine for a slowly-recovering dependency, not rare like item 10.
+- **The store's own replication/failover consistency is inherited, not solved** (item 12 below) — this library adds no consensus layer on top of whatever your Redis deployment already guarantees.
 - **Clock skew causes timing disagreement, not state disagreement** (item 3 below) — it can shift exactly when a trial becomes eligible, but it cannot cause a double-trial, since that's arbitrated by the store, not by comparing clocks.
 
 ### What's still a fundamental tradeoff, not a bug
@@ -222,7 +227,8 @@ These are true of any distributed circuit breaker, rate limiter, or lock built o
 8. **`errorRate` is EWMA-smoothed, not a precise sliding window.** It approximates "failure rate over roughly the last ~`1/(1-decay)` calls," not an exact count over an exact window — good enough to catch flapping dependencies, but the exact trip point for a given call sequence is a function of the decay math, not literally "N of the last M calls."
 9. **A partitioned instance fails open on its own, independently of the rest of the fleet.** If an instance's own call to the store errors (that instance can't reach Redis, but others can), it doesn't consult anyone else — it applies `failOpenOnStoreError` locally (default `true`). For the duration of that partition, the isolated instance treats the breaker as closed while the rest of the fleet, still able to reach the store, correctly sees it open. This is scoped to exactly the partitioned instance for exactly the duration of the partition, and it's a deliberate choice: favoring that one instance staying available over it blocking calls based on a store it can't even confirm the state of.
 10. **A `claimTrial` error can rarely let two instances both believe they won the trial.** If the `claimTrial` call itself throws (not "no key", an actual error), the gate does not block the caller — it fails open on the trial too (`allowed: true, isTrial: true`), because refusing here would mean a single store blip at exactly the wrong moment could permanently wedge the breaker open (no one could ever claim the trial again). If two instances hit that specific error in the same narrow window, both can proceed with a trial call. This trades a rare double-trial for never risking permanent lockout.
-11. **`RedisStore` inherits Redis's own replication/failover consistency — it doesn't add a consensus layer on top.** A single Redis instance has nothing to split-brain over. But if you run Sentinel or Cluster behind it, a failover with asynchronous replication can lose the last few writes, and reading from a lagging replica can return stale state. `RedisStore` doesn't issue `WAIT` or otherwise wait for replica acknowledgment — it trusts whatever consistency guarantees your Redis deployment itself provides.
+11. **The trial-claim TTL expiring mid-flight is a more likely double-trial window than item 10, and it's by design.** `claimTrial`'s key has a TTL of `trialTimeout` (default `min(timeout ?? 10000, resetTimeout)`). If the trial call itself runs *longer* than that TTL, the claim expires while the call is still in flight, and another instance can then claim a second trial against the same recovering dependency — this is the intended anti-wedging mechanism (nothing should be able to hold the exclusive slot forever), not a bug. It's also the routine case, not the rare one: a slowly-recovering dependency whose first trial takes 12 seconds against a 10-second default `trialTimeout` will hit this on every recovery attempt, not occasionally. Set `trialTimeout` comfortably above your dependency's real p99 recovery-check latency if avoiding this matters to you. **What this does *not* do, strictly bounded by the release mechanism:** cascade into a third concurrent trial. `claimTrial` returns a per-call ownership token, and releasing a claim is always either a compare-and-delete against that exact token or nothing at all — never an unconditional delete — so the original caller's own expired claim, once it finally gets released, can never destroy whichever *other* instance's claim now legitimately occupies the key. That makes this limitation "double trial, strictly bounded to two" rather than "double trial, possibly cascading further."
+12. **`RedisStore` inherits Redis's own replication/failover consistency — it doesn't add a consensus layer on top.** A single Redis instance has nothing to split-brain over. But if you run Sentinel or Cluster behind it, a failover with asynchronous replication can lose the last few writes, and reading from a lagging replica can return stale state. `RedisStore` doesn't issue `WAIT` or otherwise wait for replica acknowledgment — it trusts whatever consistency guarantees your Redis deployment itself provides.
 
 ### What redeye deliberately does not try to be
 

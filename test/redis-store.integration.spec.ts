@@ -106,14 +106,38 @@ describe('RedisStore (integration)', () => {
     });
   });
 
-  describe('claimTrial', () => {
-    it('only the first caller claims the slot; it is released once the TTL expires', async () => {
-      await expect(store.claimTrial('op:trial', 1)).resolves.toBe(true);
-      await expect(store.claimTrial('op:trial', 1)).resolves.toBe(false);
+  describe('claimTrial / releaseTrial', () => {
+    it('only the first caller claims the slot, and gets a distinct token each time; it is released once the TTL expires', async () => {
+      const tokenA = await store.claimTrial('op:trial', 1);
+      expect(typeof tokenA).toBe('string');
+      await expect(store.claimTrial('op:trial', 1)).resolves.toBeNull();
 
       await new Promise((resolve) => setTimeout(resolve, 1100));
 
-      await expect(store.claimTrial('op:trial', 1)).resolves.toBe(true);
+      const tokenB = await store.claimTrial('op:trial', 1);
+      expect(typeof tokenB).toBe('string');
+      expect(tokenB).not.toBe(tokenA);
+    });
+
+    it('releaseTrial only releases the claim matching its own token (compare-and-delete)', async () => {
+      const staleToken = await store.claimTrial('op:trial', 1);
+      expect(staleToken).not.toBeNull();
+
+      // Simulate the real-world sequence from the trial-TTL-expiry limitation:
+      // the original claim's TTL elapses, and a different instance claims a
+      // fresh trial on the same key before the original caller's (slow) call
+      // ever gets around to releasing its now-stale claim.
+      await new Promise((resolve) => setTimeout(resolve, 1100));
+      const freshToken = await store.claimTrial('op:trial', 30);
+      expect(freshToken).not.toBeNull();
+      expect(freshToken).not.toBe(staleToken);
+
+      // The original caller finally releases with its stale token. This must
+      // not delete the fresh claim -- an unconditional DEL would, a
+      // compare-and-delete must not.
+      await store.releaseTrial('op:trial', staleToken as string);
+
+      await expect(store.claimTrial('op:trial', 30)).resolves.toBeNull(); // still held by freshToken
     });
   });
 });

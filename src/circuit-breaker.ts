@@ -121,6 +121,16 @@ interface Gate {
   allowed: boolean;
   /** True if this call claimed the exclusive half-open trial slot. */
   isTrial: boolean;
+  /**
+   * The ownership token returned by `Store.claimTrial`, when a real claim
+   * was made. Used to release the claim via compare-and-delete. Undefined
+   * when `isTrial` is true without a real claim (the store lacks
+   * `claimTrial`, or `claimTrial` itself errored and the gate failed open
+   * on the trial) — those paths have nothing to compare against, so no
+   * release is attempted at all; the claim (if any exists) expires via its
+   * TTL instead.
+   */
+  trialToken?: string;
 }
 
 /**
@@ -158,6 +168,7 @@ export class CircuitBreaker {
   private readonly warnedCapabilities = new Set<string>();
   private warnedCanExecuteInDistributedMode = false;
   private readonly metrics = new Map<string, CircuitMetrics>();
+  private readonly cachedResetTimeouts = new Map<string, { openCount: number; lastFailure: number; value: number }>();
 
   // local mode state
   private readonly failures = new Map<string, number>();
@@ -254,9 +265,27 @@ export class CircuitBreaker {
 
   recordSuccess(operation: string): void {
     if (this.distributed) {
-      void this.closeDistributed(operation);
+      void this.closeDistributedAndNotify(operation);
     } else {
       this.resetLocal(operation);
+    }
+  }
+
+  /**
+   * Used by the manual `recordSuccess()` API only — `execute()`'s own
+   * success paths already know locally whether they're closing from a real
+   * trial (and fire `onStateChange` directly) or from an already-closed
+   * state (where firing would be spurious), so they call `closeDistributed`
+   * without this extra read. `recordSuccess()` has no such context — the
+   * caller might invoke it on a breaker that's actually open — so it pays
+   * for one extra read to detect a real transition, matching what `reset()`
+   * already does.
+   */
+  private async closeDistributedAndNotify(operation: string): Promise<void> {
+    const prior = await this.safeGet(operation);
+    await this.closeDistributed(operation);
+    if (prior?.isOpen) {
+      this.options.onStateChange?.('closed', operation);
     }
   }
 
@@ -277,6 +306,7 @@ export class CircuitBreaker {
       const prior = await this.safeGet(operation);
       await this.safeDelMain(operation);
       await this.safeDelTrial(operation);
+      this.cachedResetTimeouts.delete(operation);
       if (prior?.isOpen) {
         this.options.onStateChange?.('closed', operation);
       }
@@ -309,12 +339,34 @@ export class CircuitBreaker {
 
   // ---- backoff / jitter -------------------------------------------------
 
-  private effectiveResetTimeout(openCount: number): number {
+  private backoffCapped(openCount: number): number {
     const backed = this.options.resetTimeout * Math.pow(this.options.backoffMultiplier, openCount);
-    const capped = Math.min(backed, this.options.maxResetTimeout);
-    if (!this.options.jitter) return capped;
-    const delta = capped * this.options.jitter;
-    return capped + (Math.random() * 2 - 1) * delta;
+    return Math.min(backed, this.options.maxResetTimeout);
+  }
+
+  /**
+   * Jitter is rolled once per open "episode" — identified by (openCount,
+   * lastFailure), which only change when the breaker opens or a trial fails
+   * — and cached, not re-rolled on every gate check. Re-rolling per call
+   * would let callers keep sampling until a roll happens to pass, which
+   * systematically biases the effective earliest trial time toward
+   * `capped * (1 - jitter)` instead of spreading it around the nominal
+   * timeout, and could flip a call between "blocked" and "eligible" and
+   * back on consecutive checks milliseconds apart.
+   */
+  private effectiveResetTimeout(operation: string, openCount: number, lastFailure: number): number {
+    const cached = this.cachedResetTimeouts.get(operation);
+    if (cached && cached.openCount === openCount && cached.lastFailure === lastFailure) {
+      return cached.value;
+    }
+    const capped = this.backoffCapped(openCount);
+    let value = capped;
+    if (this.options.jitter) {
+      const delta = capped * this.options.jitter;
+      value = capped + (Math.random() * 2 - 1) * delta;
+    }
+    this.cachedResetTimeouts.set(operation, { openCount, lastFailure, value });
+    return value;
   }
 
   // ---- distributed mode -----------------------------------------------
@@ -331,8 +383,10 @@ export class CircuitBreaker {
     // A generous safety-net TTL, decoupled from the actual gating decision
     // (which uses lastFailure + effectiveResetTimeout below) so early
     // eviction degrades gracefully rather than being the sole correctness
-    // mechanism. See README limitation on store TTL trust.
-    return Math.max(1, Math.ceil((this.effectiveResetTimeout(openCount) * 3) / 1000));
+    // mechanism. See README limitation on store TTL trust. Uses the
+    // unjittered bound — jitter exists to spread out gating decisions, not
+    // to vary a generous cleanup TTL.
+    return Math.max(1, Math.ceil((this.backoffCapped(openCount) * 3) / 1000));
   }
 
   private trialTtlSeconds(): number {
@@ -345,7 +399,7 @@ export class CircuitBreaker {
     this.options.onStoreError?.(error, operation);
   }
 
-  private warnMissingCapability(capability: 'recordFailureAtomic' | 'recordOutcomeAtomic' | 'claimTrial'): void {
+  private warnMissingCapability(capability: 'recordFailureAtomic' | 'recordOutcomeAtomic' | 'claimTrial' | 'releaseTrial'): void {
     if (this.warnedCapabilities.has(capability)) return;
     this.warnedCapabilities.add(capability);
     this.options.logger.warn(
@@ -379,7 +433,7 @@ export class CircuitBreaker {
     }
   }
 
-  /** Deletes the trial-claim key for `operation`, releasing it early instead of waiting for its TTL. Best-effort. */
+  /** Deletes the trial-claim key for `operation` unconditionally, releasing it early instead of waiting for its TTL. Only for a full reset/wipe — see `safeReleaseTrial` for releasing a specific held claim. Best-effort. */
   private async safeDelTrial(operation: string): Promise<void> {
     try {
       await this.options.store!.del(this.trialKey(operation));
@@ -388,8 +442,39 @@ export class CircuitBreaker {
     }
   }
 
+  /**
+   * Releases a trial claim this call actually won, early instead of
+   * waiting for its TTL. Uses a compare-and-delete (`Store.releaseTrial`)
+   * so a trial that outran its TTL can't delete a *different* instance's
+   * newer claim on the same key (see README limitation on trial-TTL
+   * expiry).
+   *
+   * Deliberately does *not* fall back to an unconditional delete when
+   * there's no token (the gate failed open on the trial without a
+   * confirmed claim — e.g. `claimTrial` itself errored) or the store lacks
+   * `releaseTrial` (an incomplete custom `Store`) — an unconditional delete
+   * in either case would recreate the exact bug this token scheme exists to
+   * prevent: deleting a claim we never confirmed is ours, which may by now
+   * belong to a different instance. The worst case for doing nothing is the
+   * slot staying occupied up to `trialTimeout` longer than it needs to —
+   * bounded and safe. Best-effort: logged, never thrown.
+   */
+  private async safeReleaseTrial(operation: string, token: string | undefined): Promise<void> {
+    if (!token) return;
+    if (!this.options.store!.releaseTrial) {
+      this.warnMissingCapability('releaseTrial');
+      return;
+    }
+    try {
+      await this.options.store!.releaseTrial(this.trialKey(operation), token);
+    } catch (error) {
+      this.reportStoreError(error, operation);
+    }
+  }
+
   private async closeDistributed(operation: string): Promise<void> {
     await this.safeSet(operation, { ...CLOSED_STATE }, this.stateTtlSeconds(0));
+    this.cachedResetTimeouts.delete(operation);
   }
 
   /**
@@ -410,7 +495,7 @@ export class CircuitBreaker {
 
     if (!state?.isOpen) return { allowed: true, isTrial: false };
 
-    const effective = this.effectiveResetTimeout(state.openCount ?? 0);
+    const effective = this.effectiveResetTimeout(operation, state.openCount ?? 0, state.lastFailure);
     if (Date.now() - state.lastFailure < effective) {
       return { allowed: false, isTrial: false };
     }
@@ -419,9 +504,9 @@ export class CircuitBreaker {
 
     if (this.options.store!.claimTrial) {
       try {
-        const claimed = await this.options.store!.claimTrial(this.trialKey(operation), this.trialTtlSeconds());
-        if (claimed) this.options.onStateChange?.('half-open', operation);
-        return { allowed: claimed, isTrial: claimed };
+        const token = await this.options.store!.claimTrial(this.trialKey(operation), this.trialTtlSeconds());
+        if (token) this.options.onStateChange?.('half-open', operation);
+        return { allowed: token !== null, isTrial: token !== null, trialToken: token ?? undefined };
       } catch (error) {
         this.reportStoreError(error, operation);
         if (!this.options.failOpenOnStoreError) throw new StoreUnavailableError(operation, error);
@@ -451,7 +536,7 @@ export class CircuitBreaker {
       metrics.totalSuccesses++;
       if (gate.isTrial) {
         await this.closeDistributed(operation);
-        await this.safeDelTrial(operation);
+        await this.safeReleaseTrial(operation, gate.trialToken);
         this.options.onStateChange?.('closed', operation);
       } else if (this.options.strategy === 'errorRate') {
         await this.recordOutcomeDistributed(operation, true);
@@ -463,7 +548,7 @@ export class CircuitBreaker {
       metrics.totalFailures++;
       if (gate.isTrial) {
         await this.reopenAfterFailedTrialDistributed(operation);
-        await this.safeDelTrial(operation);
+        await this.safeReleaseTrial(operation, gate.trialToken);
       } else if (this.options.strategy === 'errorRate') {
         await this.recordOutcomeDistributed(operation, false);
       } else {
@@ -500,7 +585,12 @@ export class CircuitBreaker {
       failures: current.failures + 1,
       lastFailure: Date.now(),
       isOpen: current.failures + 1 >= this.options.failureThreshold,
-      openCount: 0,
+      // Preserve, don't reset: a closed-phase failure can't normally happen
+      // while the breaker is open, but under failOpenOnStoreError a store
+      // blip on the gate read can let a call proceed while state.isOpen is
+      // still true elsewhere, and this write must not wipe accumulated
+      // backoff if that call then fails and lands here.
+      openCount: current.openCount ?? 0,
       errorRate: current.errorRate ?? 0,
       sampleCount: current.sampleCount ?? 0,
     };
@@ -581,6 +671,7 @@ export class CircuitBreaker {
     };
     await this.safeSet(operation, next, this.stateTtlSeconds(openCount));
     this.options.logger.warn(`Half-open trial failed for operation: ${operation}; backing off (attempt ${openCount + 1})`);
+    this.options.onStateChange?.('open', operation);
   }
 
   // ---- local mode -------------------------------------------------------
@@ -625,7 +716,7 @@ export class CircuitBreaker {
 
     const openCount = this.openCounts.get(operation) ?? 0;
     const lastFailure = this.lastFailureTime.get(operation) ?? 0;
-    const effective = this.effectiveResetTimeout(openCount);
+    const effective = this.effectiveResetTimeout(operation, openCount, lastFailure);
 
     if (Date.now() - lastFailure < effective) {
       this.options.logger.warn(`Circuit breaker open for operation: ${operation}`);
@@ -640,7 +731,7 @@ export class CircuitBreaker {
 
     const openCount = this.openCounts.get(operation) ?? 0;
     const lastFailure = this.lastFailureTime.get(operation) ?? 0;
-    const effective = this.effectiveResetTimeout(openCount);
+    const effective = this.effectiveResetTimeout(operation, openCount, lastFailure);
 
     if (Date.now() - lastFailure < effective) {
       this.options.logger.warn(`Circuit breaker open for operation: ${operation}`);
@@ -698,6 +789,7 @@ export class CircuitBreaker {
     this.openCounts.set(operation, openCount);
     this.lastFailureTime.set(operation, Date.now());
     this.options.logger.warn(`Half-open trial failed for operation: ${operation}; backing off (attempt ${openCount + 1})`);
+    this.options.onStateChange?.('open', operation);
   }
 
   private resetLocal(operation: string): void {
@@ -710,6 +802,7 @@ export class CircuitBreaker {
     this.trialClaimedAt.delete(operation);
     this.errorRates.delete(operation);
     this.sampleCounts.delete(operation);
+    this.cachedResetTimeouts.delete(operation);
     if (wasOpen) {
       this.options.onStateChange?.('closed', operation);
     }

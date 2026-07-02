@@ -18,6 +18,23 @@ class InMemoryStore implements Store {
   }
 }
 
+/** No atomic capabilities (forces the non-atomic fallback path), and can be told to fail exactly its next `get()` call, to simulate a transient store blip on one specific read. */
+class FlakyGateStore extends InMemoryStore {
+  private failNextGet = false;
+
+  triggerNextGetFailure(): void {
+    this.failNextGet = true;
+  }
+
+  async get<T>(key: string): Promise<T | null> {
+    if (this.failNextGet) {
+      this.failNextGet = false;
+      throw new Error('transient blip');
+    }
+    return super.get<T>(key);
+  }
+}
+
 /** Implements the optional atomic capabilities, the way RedisStore does. */
 class AtomicInMemoryStore implements Store {
   private data = new Map<string, unknown>();
@@ -85,10 +102,58 @@ class AtomicInMemoryStore implements Store {
     return { ...next, openedNow: isOpen && !current.isOpen };
   }
 
-  async claimTrial(key: string): Promise<boolean> {
-    if (this.data.has(key)) return false;
-    this.data.set(key, '1');
-    return true;
+  async claimTrial(key: string): Promise<string | null> {
+    if (this.data.has(key)) return null;
+    const token = `token-${Math.random().toString(36).slice(2)}`;
+    this.data.set(key, token);
+    return token;
+  }
+
+  async releaseTrial(key: string, token: string): Promise<void> {
+    if (this.data.get(key) === token) {
+      this.data.delete(key);
+    }
+  }
+}
+
+/** Implements the atomic capabilities plus claimTrial, but can be told to fail exactly its next claimTrial() call, to simulate a transient error on the claim itself. */
+class FlakyClaimStore extends AtomicInMemoryStore {
+  private throwNextClaim = false;
+
+  triggerNextClaimFailure(): void {
+    this.throwNextClaim = true;
+  }
+
+  async claimTrial(key: string): Promise<string | null> {
+    if (this.throwNextClaim) {
+      this.throwNextClaim = false;
+      throw new Error('transient claim blip');
+    }
+    return super.claimTrial(key);
+  }
+}
+
+/** Implements claimTrial (a real claim happens) but not releaseTrial, simulating an incomplete custom Store. */
+class ClaimOnlyStore implements Store {
+  private data = new Map<string, unknown>();
+
+  async get<T>(key: string): Promise<T | null> {
+    return (this.data.get(key) as T) ?? null;
+  }
+
+  async set<T>(key: string, value: T): Promise<void> {
+    this.data.set(key, value);
+  }
+
+  async del(key: string): Promise<void> {
+    this.data.delete(key);
+  }
+
+  async claimTrial(key: string): Promise<string | null> {
+    if (this.data.has(key)) return null;
+    const token = `token-${Math.random().toString(36).slice(2)}`;
+    this.data.set(key, token);
+    return token;
   }
 }
 
@@ -154,6 +219,43 @@ describe('CircuitBreaker (local mode)', () => {
 
     await expect(breaker.execute('op-a', fail)).rejects.toThrow();
     await expect(breaker.execute('op-b', succeed)).resolves.toBe('ok');
+    breaker.destroy();
+  });
+});
+
+describe('CircuitBreaker (jitter)', () => {
+  it('rolls jitter once per open episode, not on every gate check', async () => {
+    const breaker = new CircuitBreaker({ failureThreshold: 1, resetTimeout: 1000, jitter: 0.5 });
+    await expect(breaker.execute('op', fail)).rejects.toThrow();
+
+    const randomSpy = jest.spyOn(Math, 'random');
+    breaker.canExecute('op');
+    breaker.canExecute('op');
+    breaker.canExecute('op');
+    expect(randomSpy).toHaveBeenCalledTimes(1);
+
+    randomSpy.mockRestore();
+    breaker.destroy();
+  });
+
+  it('rolls a fresh jitter value after a failed trial (new episode, new openCount)', async () => {
+    // resetTimeout 30ms + jitter 0.5 means the effective timeout for episode
+    // 1 (openCount 0) is at most 45ms; wait comfortably past that so the
+    // trial attempt below is never blocked by an unlucky jitter roll.
+    const breaker = new CircuitBreaker({ failureThreshold: 1, resetTimeout: 30, jitter: 0.5 });
+    await expect(breaker.execute('op', fail)).rejects.toThrow();
+    await new Promise((resolve) => setTimeout(resolve, 60));
+
+    const randomSpy = jest.spyOn(Math, 'random');
+    await expect(breaker.execute('op', fail)).rejects.toThrow(); // trial fails -> new episode (openCount 1)
+    expect(randomSpy).toHaveBeenCalledTimes(1); // rolled once for episode 1, during the trial's own gate claim
+
+    randomSpy.mockClear();
+    breaker.canExecute('op'); // first check of episode 2 -> cache miss -> rolls once
+    breaker.canExecute('op'); // second check of episode 2 -> cache hit -> no additional roll
+    expect(randomSpy).toHaveBeenCalledTimes(1);
+
+    randomSpy.mockRestore();
     breaker.destroy();
   });
 });
@@ -349,6 +451,95 @@ describe('CircuitBreaker (atomic distributed store)', () => {
     expect(capabilityWarnings).toHaveLength(1);
     breaker.destroy();
   });
+
+  it('fires onStateChange with open again when a distributed half-open trial fails, not silence', async () => {
+    const store = new AtomicInMemoryStore();
+    const onStateChange = jest.fn();
+    const breaker = new CircuitBreaker({ failureThreshold: 1, resetTimeout: 30, store, onStateChange });
+
+    await expect(breaker.execute('op', fail)).rejects.toThrow();
+    await new Promise((resolve) => setTimeout(resolve, 40));
+
+    await expect(breaker.execute('op', fail)).rejects.toThrow(); // this is the trial, and it fails too
+
+    const order = onStateChange.mock.calls.map((call) => call[0]);
+    expect(order).toEqual(['open', 'half-open', 'open']);
+    breaker.destroy();
+  });
+
+  it('recordSuccess fires onStateChange closed in distributed mode too, matching local mode', async () => {
+    const store = new AtomicInMemoryStore();
+    const onStateChange = jest.fn();
+    const breaker = new CircuitBreaker({ failureThreshold: 1, resetTimeout: 60000, store, onStateChange });
+
+    await expect(breaker.execute('op', fail)).rejects.toThrow();
+    expect(await breaker.getState('op')).toMatchObject({ isOpen: true });
+
+    breaker.recordSuccess('op');
+    await new Promise((resolve) => setImmediate(resolve)); // recordSuccess is fire-and-forget
+
+    expect(await breaker.getState('op')).toMatchObject({ isOpen: false });
+    expect(onStateChange).toHaveBeenCalledWith('closed', 'op');
+    breaker.destroy();
+  });
+
+  it('does not wipe accumulated backoff (openCount) when a closed-phase failure lands via the non-atomic fallback after a fail-open gate blip', async () => {
+    const store = new FlakyGateStore();
+    const breaker = new CircuitBreaker({ failureThreshold: 1, resetTimeout: 30, jitter: 0, store });
+
+    await expect(breaker.execute('op', fail)).rejects.toThrow(); // trip #1 -> openCount 0
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    await expect(breaker.execute('op', fail)).rejects.toThrow(); // trial fails -> openCount 1
+
+    expect((await breaker.getState('op')).openCount).toBe(1);
+
+    // Simulate a transient store blip on exactly the next gate read: the
+    // call proceeds fail-open even though the breaker is really still open
+    // elsewhere, the wrapped fn fails for real, and the failure is recorded
+    // via the non-atomic fallback (this store has no recordFailureAtomic).
+    store.triggerNextGetFailure();
+    await expect(breaker.execute('op', fail)).rejects.toThrow('boom');
+
+    expect((await breaker.getState('op')).openCount).toBe(1); // preserved, not reset to 0
+    breaker.destroy();
+  });
+
+  it('does not delete the trial key at all when releasing a tokenless trial (claimTrial errored) -- lets the TTL clean up instead of risking a stale delete of someone else\'s claim', async () => {
+    const store = new FlakyClaimStore();
+    const delSpy = jest.spyOn(store, 'del');
+    const releaseSpy = jest.spyOn(store, 'releaseTrial');
+    const breaker = new CircuitBreaker({ failureThreshold: 1, resetTimeout: 30, store });
+
+    await expect(breaker.execute('op', fail)).rejects.toThrow();
+    await new Promise((resolve) => setTimeout(resolve, 40));
+
+    // Force the upcoming claimTrial call to throw, so this call proceeds as
+    // a tokenless trial (fail-open on the trial itself) without ever
+    // actually writing a claim to the store.
+    store.triggerNextClaimFailure();
+    await expect(breaker.execute('op', succeed)).resolves.toBe('ok');
+
+    expect(delSpy).not.toHaveBeenCalled();
+    expect(releaseSpy).not.toHaveBeenCalled();
+    breaker.destroy();
+  });
+
+  it('warns once when the store implements claimTrial but not releaseTrial, and does not fall back to an unconditional delete', async () => {
+    const store = new ClaimOnlyStore();
+    const delSpy = jest.spyOn(store, 'del');
+    const logger = { warn: jest.fn(), log: jest.fn() };
+    const breaker = new CircuitBreaker({ failureThreshold: 1, resetTimeout: 30, store, logger });
+
+    await expect(breaker.execute('op', fail)).rejects.toThrow();
+    await new Promise((resolve) => setTimeout(resolve, 40));
+
+    await expect(breaker.execute('op', succeed)).resolves.toBe('ok'); // real claim via claimTrial, but no releaseTrial to release it with
+
+    const releaseTrialWarnings = logger.warn.mock.calls.filter((call) => String(call[0]).includes('releaseTrial'));
+    expect(releaseTrialWarnings).toHaveLength(1);
+    expect(delSpy).not.toHaveBeenCalled();
+    breaker.destroy();
+  });
 });
 
 describe('CircuitBreaker (half-open, local mode)', () => {
@@ -387,6 +578,20 @@ describe('CircuitBreaker (half-open, local mode)', () => {
 
     const order = onStateChange.mock.calls.map((call) => call[0]);
     expect(order).toEqual(['open', 'half-open', 'closed']);
+    breaker.destroy();
+  });
+
+  it('fires onStateChange with open again when a half-open trial fails, not silence', async () => {
+    const onStateChange = jest.fn();
+    const breaker = new CircuitBreaker({ failureThreshold: 1, resetTimeout: 30, onStateChange });
+
+    await expect(breaker.execute('op', fail)).rejects.toThrow();
+    await new Promise((resolve) => setTimeout(resolve, 40));
+
+    await expect(breaker.execute('op', fail)).rejects.toThrow(); // this is the trial, and it fails too
+
+    const order = onStateChange.mock.calls.map((call) => call[0]);
+    expect(order).toEqual(['open', 'half-open', 'open']);
     breaker.destroy();
   });
 });
