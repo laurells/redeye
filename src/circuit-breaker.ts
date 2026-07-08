@@ -113,6 +113,15 @@ export interface CircuitBreakerOptions {
   failOpenOnStoreError?: boolean;
   onStoreError?: (error: unknown, operation: string) => void;
   logger?: BreakerLogger;
+  /**
+   * Warns (once) once the number of distinct `operation` names this breaker
+   * has seen exceeds this count. `operation` is meant to be a small, fixed
+   * set of dependency names — every distinct value gets its own entry in
+   * several per-instance maps that are never evicted, so a dynamic name
+   * (a tenant ID, a URL, a user ID interpolated in) leaks memory
+   * indefinitely. Unset (default): no limit, no warning. See README.
+   */
+  maxOperations?: number;
 }
 
 const noopLogger: BreakerLogger = { warn: () => {}, log: () => {} };
@@ -152,7 +161,14 @@ export class CircuitBreaker {
   private readonly options: Required<
     Omit<
       CircuitBreakerOptions,
-      'onStateChange' | 'store' | 'timeout' | 'logger' | 'onStoreError' | 'trialTimeout' | 'maxResetTimeout'
+      | 'onStateChange'
+      | 'store'
+      | 'timeout'
+      | 'logger'
+      | 'onStoreError'
+      | 'trialTimeout'
+      | 'maxResetTimeout'
+      | 'maxOperations'
     >
   > & {
     onStateChange?: (state: CircuitState, operation: string) => void;
@@ -162,11 +178,15 @@ export class CircuitBreaker {
     onStoreError?: (error: unknown, operation: string) => void;
     trialTimeout: number;
     maxResetTimeout: number;
+    maxOperations?: number;
   };
 
   private readonly distributed: boolean;
   private readonly warnedCapabilities = new Set<string>();
   private warnedCanExecuteInDistributedMode = false;
+  private readonly knownOperations = new Set<string>();
+  private warnedMaxOperations = false;
+  private warnedDynamicOperationName = false;
   private readonly metrics = new Map<string, CircuitMetrics>();
   private readonly cachedResetTimeouts = new Map<string, { openCount: number; lastFailure: number; value: number }>();
 
@@ -202,6 +222,7 @@ export class CircuitBreaker {
       failOpenOnStoreError: options.failOpenOnStoreError ?? true,
       onStoreError: options.onStoreError,
       logger: options.logger ?? noopLogger,
+      maxOperations: options.maxOperations,
     };
 
     this.distributed = !!options.store;
@@ -216,7 +237,37 @@ export class CircuitBreaker {
   }
 
   async execute<T>(operation: string, fn: () => Promise<T>): Promise<T> {
+    this.checkOperationName(operation);
     return this.distributed ? this.executeDistributed(operation, fn) : this.executeLocal(operation, fn);
+  }
+
+  /**
+   * One-time, best-effort warnings for `operation` values that look like a
+   * per-request value (a URL, a tenant/user ID) rather than a small, fixed
+   * dependency name — see the README note on why that leaks memory. Cheap
+   * heuristics only (length, slashes); not a validator, and never rejects a
+   * call.
+   */
+  private checkOperationName(operation: string): void {
+    if (!this.warnedDynamicOperationName && (operation.length > 100 || operation.includes('/'))) {
+      this.warnedDynamicOperationName = true;
+      const shown = operation.length > 100 ? `${operation.slice(0, 100)}…` : operation;
+      this.options.logger.warn(
+        `Circuit breaker operation name "${shown}" looks dynamic (${
+          operation.length > 100 ? `${operation.length} chars` : 'contains "/"'
+        }). operation should be a small, fixed set of names (e.g. "payment-gateway"), not a value interpolated per request (a URL, tenant ID, user ID) — every distinct name is tracked forever and never evicted. See README.`,
+      );
+    }
+
+    if (this.options.maxOperations !== undefined && !this.warnedMaxOperations && !this.knownOperations.has(operation)) {
+      this.knownOperations.add(operation);
+      if (this.knownOperations.size > this.options.maxOperations) {
+        this.warnedMaxOperations = true;
+        this.options.logger.warn(
+          `Circuit breaker has seen ${this.knownOperations.size} distinct operation names, exceeding maxOperations (${this.options.maxOperations}). This usually means operation names are dynamic instead of a small fixed set, which leaks memory indefinitely. See README.`,
+        );
+      }
+    }
   }
 
   /**
@@ -250,6 +301,7 @@ export class CircuitBreaker {
   }
 
   recordFailure(operation: string): void {
+    this.checkOperationName(operation);
     if (this.distributed) {
       if (this.options.strategy === 'errorRate') {
         void this.recordOutcomeDistributed(operation, false);
@@ -264,6 +316,7 @@ export class CircuitBreaker {
   }
 
   recordSuccess(operation: string): void {
+    this.checkOperationName(operation);
     if (this.distributed) {
       void this.closeDistributedAndNotify(operation);
     } else {

@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `execute()`/`recordFailure()`/`recordSuccess()` now log a one-time warning the first time they see an `operation` name over 100 characters or containing `/` — both common signs of an interpolated URL, tenant ID, or user ID rather than the small fixed dependency name `operation` is meant to be (see the existing README cardinality note). Purely a warning — it never rejects a call.
+- New optional `maxOperations` option: logs a one-time warning once the breaker has seen more distinct `operation` names than this, as an early signal that names are dynamic and leaking memory indefinitely rather than waiting to notice via memory growth. Unset by default (no limit, no warning).
+
 ## [0.2.0] - 2026-07-03
 
 **Breaking changes in this 0.x minor** (both allowed under semver's pre-1.0 rules, neither is a patch-level change):

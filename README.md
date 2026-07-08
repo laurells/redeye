@@ -142,6 +142,8 @@ Implement the two required methods against Memcached, DynamoDB, your own cache w
 
 `operation` should be a small, fixed set of names (`'payment-gateway'`, `'fraud-api'`, one per dependency) — not something you interpolate per-request values into (a tenant ID, a URL, a user ID). Every distinct `operation` string gets its own entry in several per-instance maps (metrics, local-mode failure/backoff state, an internal jitter cache) that are never evicted, so a dynamic operation name is an unbounded memory leak, the same footgun as labeling a Prometheus metric with a high-cardinality value.
 
+redeye can't stop you from doing this, but it can flag it: `execute`/`recordFailure`/`recordSuccess` log a one-time warning the first time they see an `operation` name over 100 characters or containing `/` (both common signs of an interpolated URL or ID), and — if you set `maxOperations` — a second one-time warning once the breaker has seen more distinct operation names than that. Neither check ever rejects a call; they're a smoke alarm, not enforcement.
+
 ## Options
 
 | Option | Default | Description |
@@ -163,6 +165,7 @@ Implement the two required methods against Memcached, DynamoDB, your own cache w
 | `onStateChange` | none | `(state: 'open' \| 'half-open' \| 'closed', operation: string) => void` — `'half-open'` fires exactly when a caller claims the single half-open trial slot. In distributed mode this is a per-process callback, not a fleet-wide broadcast — see [Observability](#what-redeye-actually-solves-with-redisstore-or-any-store-implementing-the-matching-optional-methods) below for which instance actually sees it. |
 | `onStoreError` | none | `(error: unknown, operation: string) => void` — fired whenever a store read/write fails, in addition to being logged |
 | `logger` | no-op | `{ warn(msg), log(msg) }` — plug in your own logger |
+| `maxOperations` | none | Logs a one-time warning once the breaker has seen more than this many distinct `operation` names — see the cardinality note above. Unset: no limit, no warning. |
 
 ### Store unavailability: fail-open vs fail-closed
 

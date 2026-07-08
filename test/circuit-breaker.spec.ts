@@ -706,3 +706,87 @@ describe('CircuitBreaker (errorRate strategy)', () => {
     breakerB.destroy();
   });
 });
+
+describe('CircuitBreaker (dynamic operation name warnings)', () => {
+  it('warns once when an operation name contains a slash', async () => {
+    const logger = { warn: jest.fn(), log: jest.fn() };
+    const breaker = new CircuitBreaker({ failureThreshold: 5, resetTimeout: 60000, logger });
+
+    await breaker.execute('/api/users/123', succeed);
+    await breaker.execute('/api/users/456', succeed);
+
+    const dynamicNameWarnings = logger.warn.mock.calls.filter((call) => String(call[0]).includes('looks dynamic'));
+    expect(dynamicNameWarnings).toHaveLength(1);
+    expect(dynamicNameWarnings[0][0]).toContain('contains "/"');
+    breaker.destroy();
+  });
+
+  it('warns once when an operation name is over 100 characters', async () => {
+    const logger = { warn: jest.fn(), log: jest.fn() };
+    const breaker = new CircuitBreaker({ failureThreshold: 5, resetTimeout: 60000, logger });
+    const longName = 'x'.repeat(150);
+
+    await breaker.execute(longName, succeed);
+
+    const dynamicNameWarnings = logger.warn.mock.calls.filter((call) => String(call[0]).includes('looks dynamic'));
+    expect(dynamicNameWarnings).toHaveLength(1);
+    expect(dynamicNameWarnings[0][0]).toContain('150 chars');
+    breaker.destroy();
+  });
+
+  it('does not warn for a normal, fixed operation name', async () => {
+    const logger = { warn: jest.fn(), log: jest.fn() };
+    const breaker = new CircuitBreaker({ failureThreshold: 5, resetTimeout: 60000, logger });
+
+    await breaker.execute('payment-gateway', succeed);
+
+    const dynamicNameWarnings = logger.warn.mock.calls.filter((call) => String(call[0]).includes('looks dynamic'));
+    expect(dynamicNameWarnings).toHaveLength(0);
+    breaker.destroy();
+  });
+
+  it('warns once via recordFailure/recordSuccess too, not just execute', async () => {
+    const logger = { warn: jest.fn(), log: jest.fn() };
+    const breaker = new CircuitBreaker({ failureThreshold: 5, resetTimeout: 60000, logger });
+
+    breaker.recordFailure('/tenants/42/checkout');
+    breaker.recordSuccess('/tenants/42/checkout');
+
+    const dynamicNameWarnings = logger.warn.mock.calls.filter((call) => String(call[0]).includes('looks dynamic'));
+    expect(dynamicNameWarnings).toHaveLength(1);
+    breaker.destroy();
+  });
+
+  it('warns once when the number of distinct operations exceeds maxOperations', async () => {
+    const logger = { warn: jest.fn(), log: jest.fn() };
+    const breaker = new CircuitBreaker({ failureThreshold: 5, resetTimeout: 60000, logger, maxOperations: 2 });
+
+    await breaker.execute('op-a', succeed);
+    await breaker.execute('op-b', succeed);
+    let maxOpWarnings = logger.warn.mock.calls.filter((call) => String(call[0]).includes('maxOperations'));
+    expect(maxOpWarnings).toHaveLength(0);
+
+    await breaker.execute('op-c', succeed);
+    maxOpWarnings = logger.warn.mock.calls.filter((call) => String(call[0]).includes('maxOperations'));
+    expect(maxOpWarnings).toHaveLength(1);
+
+    await breaker.execute('op-d', succeed);
+    await breaker.execute('op-e', succeed);
+    maxOpWarnings = logger.warn.mock.calls.filter((call) => String(call[0]).includes('maxOperations'));
+    expect(maxOpWarnings).toHaveLength(1); // still only warned once
+    breaker.destroy();
+  });
+
+  it('does not warn about maxOperations when the option is unset', async () => {
+    const logger = { warn: jest.fn(), log: jest.fn() };
+    const breaker = new CircuitBreaker({ failureThreshold: 5, resetTimeout: 60000, logger });
+
+    for (let i = 0; i < 10; i++) {
+      await breaker.execute(`op-${i}`, succeed);
+    }
+
+    const maxOpWarnings = logger.warn.mock.calls.filter((call) => String(call[0]).includes('maxOperations'));
+    expect(maxOpWarnings).toHaveLength(0);
+    breaker.destroy();
+  });
+});
