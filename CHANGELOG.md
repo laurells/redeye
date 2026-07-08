@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-08
+
+### Added
+
+- **New `openCacheRefreshMs` option: distributed-mode rejections during an open breaker no longer cost a store read.** Previously every `execute()`/`canExecuteAsync()` call did a fresh `store.get` regardless of state, so a burst of traffic against an open breaker — the exact moment a shared Redis instance may itself be under strain — scaled store load linearly with request volume, same as the healthy path. The gate now caches an observed-open state locally (`lastFailure`, `openCount`, and the same jittered `expiresAt` the real eligibility check already computes) and rejects straight from that cache, re-verifying against the store at most once per `openCacheRefreshMs` (default 2000ms) to catch an early close by another instance's trial or a manual `reset()`. The cache can only make a rejection cheaper, never a trial later: it always falls through to a real read once `expiresAt` is reached, regardless of the refresh cadence. `openCacheRefreshMs: 0` disables the cache entirely, reproducing the prior store-read-on-every-call behavior exactly. See the revised limitation item 1 in the README.
+- `canExecute()` in distributed mode now consults this same cache instead of unconditionally returning `true`: a `false` is a real, cached-open result; a `true` remains advisory (nothing cached open, or nothing cached yet — not a confirmed closed state). `canExecuteAsync()`'s existing store-aware check picks up the same cache automatically, since both share the same gate.
+
 ## [0.3.1] - 2026-07-08
 
 ### Changed
@@ -81,7 +88,8 @@ Initial release.
 - Optional per-call `timeout` and `trialTimeout`, plus a local-mode monitor that force-releases a stale half-open trial claim if a call never settles.
 - Unit test suite (in-memory fakes) and an integration test suite that runs against real Redis via `docker compose up -d && npm run test:integration`.
 
-[Unreleased]: https://github.com/laurells/redeye/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/laurells/redeye/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/laurells/redeye/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/laurells/redeye/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/laurells/redeye/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/laurells/redeye/compare/v0.1.1...v0.2.0
