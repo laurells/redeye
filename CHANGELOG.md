@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-07-08
+
+### Changed
+
+- **Distributed mode, `strategy: 'consecutive'`: a successful call against an already-clean breaker no longer writes to the store.** Previously every non-trial success called `closeDistributed` unconditionally — a full `SET CLOSED_STATE`, even when the breaker was already closed with zero accumulated failures, i.e. on every single healthy call. The gate's own read (already paid for, since it happens before every call anyway) now threads the observed state (`Gate.observedState`) through to the success path: the write is skipped when that read positively observed clean state (`null`, or `{ isOpen: false, failures: 0 }`), and still happens whenever there's real accumulated state to clear (an open breaker recovering via a non-trial path, or `failures > 0` mid-count) or when the read itself errored and we can't know what's there. Net effect: the steady-state healthy path drops from 1 read + 1 write to 1 read + 0 writes per call. Trial closes (a real open→closed transition) and `errorRate`'s `recordOutcomeAtomic` (which must see every outcome to keep the rate meaningful) are both unchanged — see the revised limitation item 1 in the README. Race analysis: if a concurrent failure lands between this call's gate read and its (now-skipped) write, not writing preserves that concurrent increment — strictly safer than the old unconditional write, which could silently erase it by overwriting with `CLOSED_STATE`.
+
 ## [0.3.0] - 2026-07-08
 
 ### Added
@@ -75,7 +81,8 @@ Initial release.
 - Optional per-call `timeout` and `trialTimeout`, plus a local-mode monitor that force-releases a stale half-open trial claim if a call never settles.
 - Unit test suite (in-memory fakes) and an integration test suite that runs against real Redis via `docker compose up -d && npm run test:integration`.
 
-[Unreleased]: https://github.com/laurells/redeye/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/laurells/redeye/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/laurells/redeye/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/laurells/redeye/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/laurells/redeye/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/laurells/redeye/compare/v0.1.0...v0.1.1
