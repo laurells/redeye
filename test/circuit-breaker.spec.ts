@@ -790,3 +790,80 @@ describe('CircuitBreaker (dynamic operation name warnings)', () => {
     breaker.destroy();
   });
 });
+
+describe('CircuitBreaker (distributed mode, skip redundant close write)', () => {
+  it('healthy steady state: N successful execute() calls against a clean key perform 0 writes', async () => {
+    const store = new InMemoryStore();
+    const setSpy = jest.spyOn(store, 'set');
+    const getSpy = jest.spyOn(store, 'get');
+    const breaker = new CircuitBreaker({ failureThreshold: 5, resetTimeout: 60000, store });
+
+    const N = 5;
+    for (let i = 0; i < N; i++) {
+      await expect(breaker.execute('op', succeed)).resolves.toBe('ok');
+    }
+
+    expect(setSpy).not.toHaveBeenCalled();
+    expect(getSpy).toHaveBeenCalledTimes(N);
+    breaker.destroy();
+  });
+
+  it('one failure then a success performs exactly one close write, since state was dirty', async () => {
+    const store = new InMemoryStore();
+    const setSpy = jest.spyOn(store, 'set');
+    const breaker = new CircuitBreaker({ failureThreshold: 5, resetTimeout: 60000, store });
+
+    await expect(breaker.execute('op', fail)).rejects.toThrow('boom');
+    expect(setSpy).toHaveBeenCalledTimes(1); // the failure write itself
+
+    setSpy.mockClear();
+    await expect(breaker.execute('op', succeed)).resolves.toBe('ok');
+    expect(setSpy).toHaveBeenCalledTimes(1); // close write, because failures: 1 was observed
+    breaker.destroy();
+  });
+
+  it('a successful half-open trial still writes the close unconditionally', async () => {
+    const store = new InMemoryStore();
+    const setSpy = jest.spyOn(store, 'set');
+    const breaker = new CircuitBreaker({ failureThreshold: 1, resetTimeout: 30, jitter: 0, store });
+
+    await expect(breaker.execute('op', fail)).rejects.toThrow('boom'); // opens the breaker
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    setSpy.mockClear();
+
+    await expect(breaker.execute('op', succeed)).resolves.toBe('ok'); // wins the trial
+    expect(setSpy).toHaveBeenCalledTimes(1); // trial close is always written, regardless of observedState
+    breaker.destroy();
+  });
+
+  it('a gate read error under failOpenOnStoreError still writes the close on success, since state could not be observed', async () => {
+    const store = new FlakyGateStore();
+    const breaker = new CircuitBreaker({ failureThreshold: 5, resetTimeout: 60000, store });
+    const setSpy = jest.spyOn(store, 'set');
+
+    store.triggerNextGetFailure();
+    await expect(breaker.execute('op', succeed)).resolves.toBe('ok');
+
+    expect(setSpy).toHaveBeenCalledTimes(1); // observedState undefined -> write anyway, can't assume clean
+    breaker.destroy();
+  });
+
+  it('errorRate strategy is unaffected: every closed-phase call still invokes recordOutcomeAtomic exactly once', async () => {
+    const store = new AtomicInMemoryStore();
+    const spy = jest.spyOn(store, 'recordOutcomeAtomic');
+    const breaker = new CircuitBreaker({
+      strategy: 'errorRate',
+      errorRateThreshold: 0.9,
+      minimumCalls: 100,
+      resetTimeout: 60000,
+      store,
+    });
+
+    await expect(breaker.execute('op', succeed)).resolves.toBe('ok');
+    await expect(breaker.execute('op', succeed)).resolves.toBe('ok');
+    await expect(breaker.execute('op', succeed)).resolves.toBe('ok');
+
+    expect(spy).toHaveBeenCalledTimes(3);
+    breaker.destroy();
+  });
+});

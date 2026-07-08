@@ -140,6 +140,12 @@ interface Gate {
    * TTL instead.
    */
   trialToken?: string;
+  /**
+   * The state the gate read observed, when a read actually happened and
+   * succeeded. Undefined when the read errored and the gate failed open —
+   * callers must NOT assume clean state in that case.
+   */
+  observedState?: CircuitBreakerState | null;
 }
 
 /**
@@ -546,32 +552,32 @@ export class CircuitBreaker {
       throw new StoreUnavailableError(operation, error);
     }
 
-    if (!state?.isOpen) return { allowed: true, isTrial: false };
+    if (!state?.isOpen) return { allowed: true, isTrial: false, observedState: state };
 
     const effective = this.effectiveResetTimeout(operation, state.openCount ?? 0, state.lastFailure);
     if (Date.now() - state.lastFailure < effective) {
-      return { allowed: false, isTrial: false };
+      return { allowed: false, isTrial: false, observedState: state };
     }
 
-    if (!claim) return { allowed: true, isTrial: false };
+    if (!claim) return { allowed: true, isTrial: false, observedState: state };
 
     if (this.options.store!.claimTrial) {
       try {
         const token = await this.options.store!.claimTrial(this.trialKey(operation), this.trialTtlSeconds());
         if (token) this.options.onStateChange?.('half-open', operation);
-        return { allowed: token !== null, isTrial: token !== null, trialToken: token ?? undefined };
+        return { allowed: token !== null, isTrial: token !== null, trialToken: token ?? undefined, observedState: state };
       } catch (error) {
         this.reportStoreError(error, operation);
         if (!this.options.failOpenOnStoreError) throw new StoreUnavailableError(operation, error);
         // Can't confirm exclusivity — fail open on the trial itself rather than deadlocking forever.
         this.options.onStateChange?.('half-open', operation);
-        return { allowed: true, isTrial: true };
+        return { allowed: true, isTrial: true, observedState: state };
       }
     }
 
     this.warnMissingCapability('claimTrial');
     this.options.onStateChange?.('half-open', operation);
-    return { allowed: true, isTrial: true };
+    return { allowed: true, isTrial: true, observedState: state };
   }
 
   private async executeDistributed<T>(operation: string, fn: () => Promise<T>): Promise<T> {
@@ -594,7 +600,20 @@ export class CircuitBreaker {
       } else if (this.options.strategy === 'errorRate') {
         await this.recordOutcomeDistributed(operation, true);
       } else {
-        await this.closeDistributed(operation);
+        // consecutive strategy, non-trial success: only write if the gate
+        // positively observed dirty state. If the read errored
+        // (observedState undefined), write anyway — we can't know.
+        //
+        // Race analysis: if a concurrent failure lands between our gate
+        // read and this skipped write, not writing preserves that failure
+        // count — strictly safer than the old unconditional
+        // `closeDistributed`, which could erase a legitimate concurrent
+        // increment by overwriting it with CLOSED_STATE.
+        const s = gate.observedState;
+        const observedClean = s !== undefined && (s === null || (!s.isOpen && s.failures === 0));
+        if (!observedClean) {
+          await this.closeDistributed(operation);
+        }
       }
       return result;
     } catch (error) {
