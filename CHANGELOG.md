@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-08
+
 ### Added
 
 - `execute()`/`recordFailure()`/`recordSuccess()` now log a one-time warning the first time they see an `operation` name over 100 characters or containing `/` — both common signs of an interpolated URL, tenant ID, or user ID rather than the small fixed dependency name `operation` is meant to be (see the existing README cardinality note). Purely a warning — it never rejects a call.
@@ -73,7 +75,8 @@ Initial release.
 - Optional per-call `timeout` and `trialTimeout`, plus a local-mode monitor that force-releases a stale half-open trial claim if a call never settles.
 - Unit test suite (in-memory fakes) and an integration test suite that runs against real Redis via `docker compose up -d && npm run test:integration`.
 
-[Unreleased]: https://github.com/laurells/redeye/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/laurells/redeye/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/laurells/redeye/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/laurells/redeye/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/laurells/redeye/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/laurells/redeye/releases/tag/v0.1.0
