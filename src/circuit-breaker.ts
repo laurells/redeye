@@ -122,6 +122,16 @@ export interface CircuitBreakerOptions {
    * indefinitely. Unset (default): no limit, no warning. See README.
    */
   maxOperations?: number;
+  /**
+   * Distributed mode only: while the breaker is known-open, reject locally
+   * without a store read, re-verifying against the store at most once per
+   * this many ms (to catch an early close by another instance's trial or a
+   * manual `reset()`). Staleness here is strictly fail-closed — a stale
+   * cache entry can only cause an extra rejection, never an extra call
+   * through. `0` disables the cache entirely (a store read on every call).
+   * Default: 2000.
+   */
+  openCacheRefreshMs?: number;
 }
 
 const noopLogger: BreakerLogger = { warn: () => {}, log: () => {} };
@@ -195,6 +205,17 @@ export class CircuitBreaker {
   private warnedDynamicOperationName = false;
   private readonly metrics = new Map<string, CircuitMetrics>();
   private readonly cachedResetTimeouts = new Map<string, { openCount: number; lastFailure: number; value: number }>();
+  /**
+   * Distributed mode only: a local, best-effort record that `operation` was
+   * last observed open, so a burst of calls during an incident can reject
+   * without a store round trip each time. `expiresAt` is the same instant
+   * the gate's own eligibility check uses (`lastFailure + effectiveResetTimeout`)
+   * — this cache can only make a rejection cheaper, never delay eligibility
+   * for a trial past that instant. `lastRefetch` paces how often a real read
+   * re-verifies the cache against the store (`openCacheRefreshMs`), to catch
+   * an early close by another instance or a manual `reset()`.
+   */
+  private readonly cachedOpen = new Map<string, { lastFailure: number; openCount: number; expiresAt: number; lastRefetch: number }>();
 
   // local mode state
   private readonly failures = new Map<string, number>();
@@ -229,6 +250,7 @@ export class CircuitBreaker {
       onStoreError: options.onStoreError,
       logger: options.logger ?? noopLogger,
       maxOperations: options.maxOperations,
+      openCacheRefreshMs: options.openCacheRefreshMs ?? 2000,
     };
 
     this.distributed = !!options.store;
@@ -278,16 +300,24 @@ export class CircuitBreaker {
 
   /**
    * Synchronous, best-effort, read-only check (never claims a trial slot).
-   * In distributed mode this cannot await the store, so it always returns
-   * `true` — use `canExecuteAsync` there.
+   * In distributed mode this cannot await the store, so it can only ever
+   * consult the local open-state cache (see `openCacheRefreshMs`): a `false`
+   * is a real, cached-open result, but a `true` is still only advisory —
+   * it means either the operation isn't cached open, or nothing has been
+   * cached yet — not a confirmed closed state. Use `canExecuteAsync` for a
+   * store-verified check.
    */
   canExecute(operation: string): boolean {
     if (this.distributed) {
       if (!this.warnedCanExecuteInDistributedMode) {
         this.warnedCanExecuteInDistributedMode = true;
         this.options.logger.warn(
-          'canExecute() always returns true in distributed mode (it cannot await the store) and does not reflect real breaker state; use canExecuteAsync() instead.',
+          'canExecute() in distributed mode cannot await the store: a false reflects a real cached-open state, but a true is only advisory, not a confirmed closed state; use canExecuteAsync() to be sure.',
         );
+      }
+      const cached = this.cachedOpen.get(operation);
+      if (cached && this.options.openCacheRefreshMs > 0 && Date.now() < cached.expiresAt) {
+        return false;
       }
       return true;
     }
@@ -366,6 +396,7 @@ export class CircuitBreaker {
       await this.safeDelMain(operation);
       await this.safeDelTrial(operation);
       this.cachedResetTimeouts.delete(operation);
+      this.cachedOpen.delete(operation);
       if (prior?.isOpen) {
         this.options.onStateChange?.('closed', operation);
       }
@@ -426,6 +457,25 @@ export class CircuitBreaker {
     }
     this.cachedResetTimeouts.set(operation, { openCount, lastFailure, value });
     return value;
+  }
+
+  /**
+   * Records that `operation` was just observed open (or authored as open,
+   * e.g. by this instance's own failed trial), so the next calls can reject
+   * from this cache instead of reading the store. Reuses
+   * `effectiveResetTimeout`'s per-episode jitter cache — same `expiresAt` the
+   * gate's real eligibility check uses, so the cache can never make a trial
+   * eligible later than it already would be.
+   */
+  private cacheOpenState(operation: string, state: Pick<CircuitBreakerState, 'lastFailure' | 'openCount'>): void {
+    const openCount = state.openCount ?? 0;
+    const effective = this.effectiveResetTimeout(operation, openCount, state.lastFailure);
+    this.cachedOpen.set(operation, {
+      lastFailure: state.lastFailure,
+      openCount,
+      expiresAt: state.lastFailure + effective,
+      lastRefetch: Date.now(),
+    });
   }
 
   // ---- distributed mode -----------------------------------------------
@@ -534,6 +584,7 @@ export class CircuitBreaker {
   private async closeDistributed(operation: string): Promise<void> {
     await this.safeSet(operation, { ...CLOSED_STATE }, this.stateTtlSeconds(0));
     this.cachedResetTimeouts.delete(operation);
+    this.cachedOpen.delete(operation);
   }
 
   /**
@@ -543,19 +594,39 @@ export class CircuitBreaker {
    * `canExecuteAsync`) is read-only and never claims.
    */
   private async gateDistributed(operation: string, claim: boolean): Promise<Gate> {
+    const cached = this.cachedOpen.get(operation);
+    if (cached && this.options.openCacheRefreshMs > 0) {
+      const now = Date.now();
+      if (now >= cached.expiresAt) {
+        // Eligible for a trial (or past due) — never serve a cached
+        // rejection here, or we'd delay eligibility past the real timeout.
+        this.cachedOpen.delete(operation);
+      } else if (now - cached.lastRefetch < this.options.openCacheRefreshMs) {
+        return { allowed: false, isTrial: false };
+      }
+      // else: refresh window elapsed but not yet eligible — fall through to
+      // a real read, which repopulates or clears the cache below based on
+      // what it finds (an early close by another instance, most likely).
+    }
+
     let state: CircuitBreakerState | null;
     try {
       state = await this.options.store!.get<CircuitBreakerState>(this.key(operation));
     } catch (error) {
       this.reportStoreError(error, operation);
+      this.cachedOpen.delete(operation); // can't trust a cache we can't re-verify
       if (this.options.failOpenOnStoreError) return { allowed: true, isTrial: false };
       throw new StoreUnavailableError(operation, error);
     }
 
-    if (!state?.isOpen) return { allowed: true, isTrial: false, observedState: state };
+    if (!state?.isOpen) {
+      this.cachedOpen.delete(operation);
+      return { allowed: true, isTrial: false, observedState: state };
+    }
 
     const effective = this.effectiveResetTimeout(operation, state.openCount ?? 0, state.lastFailure);
     if (Date.now() - state.lastFailure < effective) {
+      this.cacheOpenState(operation, state);
       return { allowed: false, isTrial: false, observedState: state };
     }
 
@@ -639,6 +710,7 @@ export class CircuitBreaker {
           now: Date.now(),
         });
         this.options.logger.warn(`Recorded failure for operation: ${operation}, total failures: ${next.failures}`);
+        if (next.isOpen) this.cacheOpenState(operation, next);
         if (next.isOpen && next.failures === this.options.failureThreshold) {
           this.options.logger.warn(`Circuit breaker opened for operation: ${operation}`);
           this.options.onStateChange?.('open', operation);
@@ -667,6 +739,7 @@ export class CircuitBreaker {
       sampleCount: current.sampleCount ?? 0,
     };
     await this.safeSet(operation, next, this.stateTtlSeconds(0));
+    if (next.isOpen) this.cacheOpenState(operation, next);
     this.options.logger.warn(`Recorded failure for operation: ${operation}, total failures: ${next.failures}`);
 
     if (next.isOpen && !current.isOpen) {
@@ -691,6 +764,7 @@ export class CircuitBreaker {
           ttlSeconds: this.stateTtlSeconds(0),
           now: Date.now(),
         });
+        if (next.isOpen) this.cacheOpenState(operation, next);
         if (next.openedNow) {
           this.options.logger.warn(
             `Circuit breaker opened for operation: ${operation} (error rate ${(next.errorRate * 100).toFixed(1)}% over ${next.sampleCount} calls)`,
@@ -721,6 +795,7 @@ export class CircuitBreaker {
       sampleCount,
     };
     await this.safeSet(operation, next, this.stateTtlSeconds(0));
+    if (isOpen) this.cacheOpenState(operation, next);
 
     if (isOpen && !current.isOpen) {
       this.options.logger.warn(
@@ -742,6 +817,7 @@ export class CircuitBreaker {
       sampleCount: current.sampleCount ?? 0,
     };
     await this.safeSet(operation, next, this.stateTtlSeconds(openCount));
+    this.cacheOpenState(operation, next); // this instance authored the open state; cache it
     this.options.logger.warn(`Half-open trial failed for operation: ${operation}; backing off (attempt ${openCount + 1})`);
     this.options.onStateChange?.('open', operation);
   }

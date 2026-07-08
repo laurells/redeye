@@ -485,7 +485,11 @@ describe('CircuitBreaker (atomic distributed store)', () => {
 
   it('does not wipe accumulated backoff (openCount) when a closed-phase failure lands via the non-atomic fallback after a fail-open gate blip', async () => {
     const store = new FlakyGateStore();
-    const breaker = new CircuitBreaker({ failureThreshold: 1, resetTimeout: 30, jitter: 0, store });
+    // openCacheRefreshMs: 0 -- this test exercises a store read that's
+    // forced to fail; the open-state cache would otherwise serve the gate
+    // check locally (correctly) and the triggered failure would never be
+    // consumed by a real read.
+    const breaker = new CircuitBreaker({ failureThreshold: 1, resetTimeout: 30, jitter: 0, store, openCacheRefreshMs: 0 });
 
     await expect(breaker.execute('op', fail)).rejects.toThrow(); // trip #1 -> openCount 0
     await new Promise((resolve) => setTimeout(resolve, 40));
@@ -864,6 +868,112 @@ describe('CircuitBreaker (distributed mode, skip redundant close write)', () => 
     await expect(breaker.execute('op', succeed)).resolves.toBe('ok');
 
     expect(spy).toHaveBeenCalledTimes(3);
+    breaker.destroy();
+  });
+});
+
+describe('CircuitBreaker (distributed mode, open-state local cache)', () => {
+  it('rejects a burst of 1,000 calls over a simulated 10s open window with reads capped by the refresh interval, not the call count', async () => {
+    jest.useFakeTimers();
+    try {
+      const store = new InMemoryStore();
+      const getSpy = jest.spyOn(store, 'get');
+      const breaker = new CircuitBreaker({ failureThreshold: 1, resetTimeout: 60000, jitter: 0, store, openCacheRefreshMs: 2000 });
+
+      await expect(breaker.execute('op', fail)).rejects.toThrow('boom'); // opens + caches
+      getSpy.mockClear();
+
+      const totalCalls = 1000;
+      const windowMs = 10000;
+      let rejections = 0;
+      for (let i = 0; i < totalCalls; i++) {
+        await expect(breaker.execute('op', succeed)).rejects.toThrow('Circuit breaker is open for operation: op');
+        rejections++;
+        jest.advanceTimersByTime(windowMs / totalCalls);
+      }
+
+      expect(rejections).toBe(totalCalls);
+      // Reads should be bounded by how many refresh windows elapsed (~5 for
+      // a 10s window at a 2s refresh interval), not by the 1,000 calls.
+      expect(getSpy.mock.calls.length).toBeLessThanOrEqual(Math.ceil(windowMs / 2000) + 2);
+      breaker.destroy();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('detects an early close by another instance once the refresh window elapses', async () => {
+    jest.useFakeTimers();
+    try {
+      const store = new InMemoryStore();
+      const breakerA = new CircuitBreaker({ failureThreshold: 1, resetTimeout: 60000, jitter: 0, store, openCacheRefreshMs: 1000 });
+      const breakerB = new CircuitBreaker({ failureThreshold: 1, resetTimeout: 60000, jitter: 0, store, openCacheRefreshMs: 1000 });
+
+      await expect(breakerA.execute('op', fail)).rejects.toThrow('boom'); // A opens it, caches open locally
+
+      await breakerB.reset('op'); // another instance closes it directly in the shared store
+
+      // A is still within its refresh window -- serves the stale cached rejection
+      await expect(breakerA.execute('op', succeed)).rejects.toThrow('Circuit breaker is open for operation: op');
+
+      jest.advanceTimersByTime(1001); // refresh window elapses
+
+      // A's next call re-reads the store, observes the close, and lets the call through
+      await expect(breakerA.execute('op', succeed)).resolves.toBe('ok');
+
+      breakerA.destroy();
+      breakerB.destroy();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('does not delay half-open eligibility past the jittered reset timeout, even with a long refresh interval', async () => {
+    const store = new AtomicInMemoryStore();
+    const breaker = new CircuitBreaker({ failureThreshold: 1, resetTimeout: 30, store, openCacheRefreshMs: 10000 });
+
+    await expect(breaker.execute('op', fail)).rejects.toThrow('boom'); // opens + caches open
+    await new Promise((resolve) => setTimeout(resolve, 40)); // past resetTimeout, well within the 10s refresh window
+
+    const results = await Promise.allSettled([
+      breaker.execute('op', succeed),
+      breaker.execute('op', succeed),
+      breaker.execute('op', succeed),
+    ]);
+
+    const fulfilled = results.filter((r) => r.status === 'fulfilled');
+    const rejected = results.filter((r) => r.status === 'rejected');
+    expect(fulfilled).toHaveLength(1); // exactly one trial claimed, despite the 10s refresh interval
+    expect(rejected).toHaveLength(2);
+    breaker.destroy();
+  });
+
+  it('openCacheRefreshMs: 0 disables the cache, reading the store on every call', async () => {
+    const store = new InMemoryStore();
+    const getSpy = jest.spyOn(store, 'get');
+    const breaker = new CircuitBreaker({ failureThreshold: 1, resetTimeout: 60000, store, openCacheRefreshMs: 0 });
+
+    await expect(breaker.execute('op', fail)).rejects.toThrow('boom');
+    getSpy.mockClear();
+
+    await expect(breaker.execute('op', succeed)).rejects.toThrow('Circuit breaker is open for operation: op');
+    await expect(breaker.execute('op', succeed)).rejects.toThrow('Circuit breaker is open for operation: op');
+    await expect(breaker.execute('op', succeed)).rejects.toThrow('Circuit breaker is open for operation: op');
+
+    expect(getSpy).toHaveBeenCalledTimes(3); // one real read per call, cache never consulted
+    breaker.destroy();
+  });
+
+  it('canExecute() returns false while the open state is cached, true otherwise', async () => {
+    const store = new InMemoryStore();
+    const breaker = new CircuitBreaker({ failureThreshold: 1, resetTimeout: 60000, store });
+
+    expect(breaker.canExecute('op')).toBe(true); // nothing cached yet -- advisory true
+
+    await expect(breaker.execute('op', fail)).rejects.toThrow('boom'); // opens + caches
+
+    expect(breaker.canExecute('op')).toBe(false); // real, cached-open result
+
     breaker.destroy();
   });
 });
