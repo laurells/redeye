@@ -1,6 +1,6 @@
 {
   "name": "redeye-breaker",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "description": "A circuit breaker for Node.js with an optional Redis-backed distributed mode, so breaker state can be shared across multiple app instances instead of being tracked per-process.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",

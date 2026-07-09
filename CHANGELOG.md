@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-07-09
+
+A second-reviewer pass on 0.5.1's fixes, checking each finding against the code rather than taking it at face value. Four were confirmed real and worth acting on; one (a naming-taste rename) was declined with reasoning recorded in the README instead.
+
+### Fixed
+
+- **The dynamic-operation-name warning's `/` heuristic could permanently shadow a real leak.** The warning is one-time — so a false positive on a legitimate namespaced fixed name (e.g. `"myapp/payment-gateway"`) didn't just annoy, it consumed the one warning this breaker will ever give, silencing it for a genuine dynamic-name leak introduced months later. Dropped the `/` check; length (over 100 characters) and `maxOperations` remain, and `maxOperations` was always the guard that actually catches a cardinality leak regardless of what the names look like.
+
+### Added
+
+- **New `isLocalCacheActive()` method.** `localCache`'s subscription setup is fire-and-forget from the constructor (a subscribe failure can't propagate as a thrown error no matter how the code is structured, without breaking the every-capability-is-independently-optional design), so there was previously no way to confirm from application code whether an opt-in `localCache` actually opted in. Check it from a health check or a startup assertion instead of relying on the one-time warning log.
+- **`RedisStore.subscribeTransitions` now fans out to multiple concurrent subscribers instead of throwing on the second call.** Multiple `CircuitBreaker`s sharing one `RedisStore` instance (a natural thing to do) each call `subscribeTransitions` independently when `localCache` is set — previously, only the first one succeeded; the second's setup failed, silently leaving its `localCache` permanently disabled (one-time warning only, easy to miss). Now one shared connection and read loop serve every registered handler, tearing down only once the last one unsubscribes. Subscribing with a *different* `eventsKey` while one is already active still throws — this store instance supports one shared events key at a time, which is the only way `CircuitBreaker` ever calls it in practice.
+
+### Documentation
+
+- Added a paragraph to the README explaining why `canExecute`/`canExecuteAsync` keep their current names rather than being renamed for clarity: the sync/async split is a common, well-understood pattern, the existing docstrings and one-time warning already carry the asymmetry, and renaming a public method is a breaking change that would spend real churn on the least consequential item raised in review.
+- Documented (in the `Store` interface's own doc comment and the README) that a `subscribeTransitions` implementation must support more than one concurrent subscriber on the same store instance, matching the fan-out fix above.
+
+3 new unit tests (`isLocalCacheActive()` across three configurations) and 3 new integration tests against real Redis (fan-out to two subscribers, the different-`eventsKey` error, and two `CircuitBreaker`s sharing one `RedisStore` both getting a working cache) — 62 unit / 24 integration, all passing.
+
 ## [0.5.1] - 2026-07-09
 
 A round of code review on 0.5.0's closed-state local cache (`localCache`) surfaced several correctness issues in how `closedCache` entries are created, overwritten, and trusted — traced end to end and fixed here. None of these change the public API; all are bug fixes to behavior shipped in 0.5.0.
@@ -122,7 +142,8 @@ Initial release.
 - Optional per-call `timeout` and `trialTimeout`, plus a local-mode monitor that force-releases a stale half-open trial claim if a call never settles.
 - Unit test suite (in-memory fakes) and an integration test suite that runs against real Redis via `docker compose up -d && npm run test:integration`.
 
-[Unreleased]: https://github.com/laurells/redeye/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/laurells/redeye/compare/v0.5.2...HEAD
+[0.5.2]: https://github.com/laurells/redeye/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/laurells/redeye/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/laurells/redeye/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/laurells/redeye/compare/v0.3.1...v0.4.0
