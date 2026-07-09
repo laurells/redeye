@@ -193,6 +193,14 @@ describe('RedisStore (integration)', () => {
         if (event) events.push(event);
       });
 
+      // subscribeTransitions() resolves once the duplicated connection is
+      // created, not once its blocking XREAD is actually registered on the
+      // server -- writing immediately after can race ahead of it (a write
+      // before the XREAD is blocked is simply never seen, since XREAD
+      // BLOCK STREAMS key $ only sees entries *after* it starts blocking).
+      // Give it a moment to actually be listening before publishing.
+      await new Promise((resolve) => setTimeout(resolve, 300));
+
       // Sub-threshold: no isOpen flip, so no transition should be published.
       await store.recordFailureAtomic('op', { ttlSeconds: 30, failureThreshold: 5, now: Date.now(), operation: 'op' });
       // Crosses the threshold: a real transition.

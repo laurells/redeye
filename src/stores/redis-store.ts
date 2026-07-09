@@ -444,6 +444,20 @@ export class RedisStore implements Store {
     let stopped = false;
     let lastId = '$';
 
+    // ioredis auto-reconnects by default, and can do so transparently enough
+    // that a command already in flight when the connection drops (e.g. this
+    // blocking XREAD, killed from the server side) doesn't necessarily
+    // reject its promise at all -- it can just resolve late once
+    // reconnected. Catching only around `xread()` therefore isn't reliable
+    // for detecting a drop; the connection's own error/close events are.
+    // `stopped` guards against firing on our *own* deliberate teardown.
+    conn.on('error', () => {
+      if (!stopped) handler(null);
+    });
+    conn.on('close', () => {
+      if (!stopped) handler(null);
+    });
+
     const loop = async (): Promise<void> => {
       while (!stopped) {
         let result: [string, [string, string[]][]][] | null;
@@ -476,7 +490,12 @@ export class RedisStore implements Store {
       if (stopped) return;
       stopped = true;
       this.subscriberConn = undefined;
-      await conn.quit();
+      // disconnect(), not quit(): quit() sends a command and waits for a
+      // reply, which can't happen promptly while this connection is
+      // (almost always) sitting inside a blocking XREAD -- Redis won't
+      // process it until the current BLOCK cycle ends on its own.
+      // disconnect() tears down the socket immediately.
+      conn.disconnect();
     };
   }
 }
