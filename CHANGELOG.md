@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-09
+
+This is the headline release of the three shipped this week: a closed-state local cache that gets `consecutive` to a genuine 0-store-op healthy path, on top of the write-skip (0.3.1) and open-state cache (0.4.0) that came before it. It's also the only one with a schema addition and new `Store` interface methods.
+
+### Added
+
+- **New `localCache` option: the closed-state local cache.** Opt-in (`localCache: { staleToleranceMs?: number }`, default `staleToleranceMs: 100`), distributed mode only, requires a store implementing the new `subscribeTransitions`. Caches CLOSED state locally per operation, invalidated push-style via a shared transition-event stream instead of polling, so a healthy `execute()` call can skip the store read entirely once the cache is warm — not just the write `closeDistributed` already learned to skip. Composes with the open-state cache: an entry observed open always defers to it, and to a real read, which remain authoritative for all rejection handling. See the new README section "Local caching (hybrid mode)" for the full model: the fail-open window as a formula (`staleToleranceMs + delivery latency`), the version/absence rule that makes rolling deploys safe, and the `errorRate` write floor this doesn't remove.
+- **`CircuitBreakerState` gained an optional `version` field** — a monotonic counter that increments only on a real transition (an `isOpen` flip, or a close clearing accumulated state), never on a plain counter/EWMA update. Its *absence* (not `0`) means "written by a pre-`localCache` library version, provenance unknown" — a cache entry built from a version-less read is never trusted for the fast path, which is what makes mixed-fleet rolling deploys safe without any particular deploy order.
+- **New optional `Store` capabilities: `closeAtomic`, `reopenTrialFailureAtomic`, `subscribeTransitions`.** `closeAtomic` closes atomically but only writes (and only bumps `version`/publishes a transition) when there was real state to clear — a genuine server-side no-op otherwise, which is what lets the Release 1 write-skip happen atomically instead of trusting the caller's own possibly-stale view. `reopenTrialFailureAtomic` is the atomic counterpart for a failed half-open trial (always a real transition, always publishes). `subscribeTransitions` subscribes to the shared transition stream, invoking its handler with a decoded event per transition, or `null` on a dropped/erroring connection (a signal to distrust every cached entry until it's re-verified by a real read). All three are independently optional, following the existing pattern: omit any of them and redeye falls back to the prior non-atomic/no-cache behavior with a one-time warning, exactly as `recordFailureAtomic`/`claimTrial` already did.
+- **`recordFailureAtomic` and `recordOutcomeAtomic` now also bump `version` and publish a transition event** (to the same shared stream `closeAtomic`/`reopenTrialFailureAtomic` use) when — and only when — they flip `isOpen`; a plain sub-threshold failure increment isn't a transition and stays silent, so the closed-state cache isn't invalidated by writes it doesn't actually need to react to.
+- **`RedisStore` implements all three new capabilities.** `closeAtomic`/`reopenTrialFailureAtomic` are two new Lua scripts (`redeyeClose`, `redeyeReopenTrialFailure`), each `XADD`-ing to a shared `circuit_breaker:events` stream on a real transition and `XTRIM MAXLEN ~ 1000`-ing it afterward — one stream per store/prefix, not one per operation, so a subscriber blocks on a single `XREAD` instead of a dynamic key list. `subscribeTransitions` lazily creates a dedicated (`duplicate()`d) connection for the blocking read (ioredis requires this — reusing the main client would stall every other command behind the block), reconnecting with backoff and re-signaling `null` on its own if that connection drops.
+- **New `bench/` script** comparing total store round trips and p50/p99 latency across three distributed-mode configurations (no caching, today's defaults, `localCache` on top) against a real Redis, over a healthy-path workload and a scripted incident. Run via `npm run bench`.
+
+### Notes on this release
+
+- **`recordFailureAtomic`'s and `recordOutcomeAtomic`'s `opts` gained a new required `operation` field** (needed to publish a transition event with the right operation name). This is non-breaking for existing custom `Store` implementations — `CircuitBreaker` still calls both with the same two positional arguments as before, just a larger `opts` object, and an implementation's own method signature narrower than the interface's is exactly what TypeScript's method-position compatibility exists to allow. It **is** a source-breaking change for any code calling these two methods directly with an inline object literal that omits `operation` — add the field if you have such a call site.
+- **This work could not be verified against a real Redis in the environment it was written in** (no Docker available). The unit suite (54 tests, all passing, using fakes that reimplement the versioning/transition logic independently) covers the `CircuitBreaker`-side cache logic thoroughly; the new integration tests (`closeAtomic`/`reopenTrialFailureAtomic`/`subscribeTransitions` at the `RedisStore` level, transition-propagation latency, subscriber-reconnect, and `XTRIM` bounding, at the `CircuitBreaker`+`RedisStore` level) and the `bench/` script both compile cleanly but are **unrun**. Run `npm run test:integration` and `npm run bench` against a real Redis before relying on this release for anything load-bearing.
+
 ## [0.4.0] - 2026-07-08
 
 ### Added
@@ -88,7 +106,8 @@ Initial release.
 - Optional per-call `timeout` and `trialTimeout`, plus a local-mode monitor that force-releases a stale half-open trial claim if a call never settles.
 - Unit test suite (in-memory fakes) and an integration test suite that runs against real Redis via `docker compose up -d && npm run test:integration`.
 
-[Unreleased]: https://github.com/laurells/redeye/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/laurells/redeye/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/laurells/redeye/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/laurells/redeye/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/laurells/redeye/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/laurells/redeye/compare/v0.2.0...v0.3.0
