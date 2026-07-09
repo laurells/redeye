@@ -297,7 +297,7 @@ docker compose down
 
 It connects to `REDIS_URL` (default `redis://localhost:6379`).
 
-`npm run bench` runs `bench/index.js` against a real Redis, comparing total store round trips and p50/p99 latency across three configurations: no caching, today's defaults (`openCacheRefreshMs`), and `localCache` on top. Same `REDIS_URL`; start Redis first the same way as the integration suite.
+`npm run bench` runs `bench/index.js` against a real Redis, comparing total store round trips and p50/p99 latency across three configurations: no caching, today's defaults (`openCacheRefreshMs`), and `localCache` on top. Same `REDIS_URL`; start Redis first the same way as the integration suite. See [BENCHMARK.md](BENCHMARK.md) for a full run's results and how to read them.
 
 ## Contributing
 
