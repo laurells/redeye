@@ -330,6 +330,54 @@ class VersionedAtomicStore implements Store {
   }
 }
 
+/**
+ * Adds a controllable deferred `get()`: after `armNextGetToDefer()`, the
+ * next `get()` call returns a promise that only resolves once
+ * `resolveNextDeferredGetWith(value)` is called, with exactly the value
+ * passed in (independent of whatever the store's real underlying data is
+ * by the time it resolves). Used to simulate a real read that's in flight
+ * when a fresher push event arrives, and only resolves (with stale data)
+ * afterward.
+ */
+class DeferredGetStore extends VersionedAtomicStore {
+  private deferNextGet = false;
+  private pendingResolvers: Array<(value: unknown) => void> = [];
+
+  armNextGetToDefer(): void {
+    this.deferNextGet = true;
+  }
+
+  async get<T>(key: string): Promise<T | null> {
+    if (this.deferNextGet) {
+      this.deferNextGet = false;
+      return new Promise<T | null>((resolve) => {
+        this.pendingResolvers.push(resolve as (value: unknown) => void);
+      });
+    }
+    return super.get<T>(key);
+  }
+
+  resolveNextDeferredGetWith(value: unknown): void {
+    const resolve = this.pendingResolvers.shift();
+    if (!resolve) throw new Error('DeferredGetStore: no deferred get() call is pending to resolve');
+    resolve(value);
+  }
+}
+
+/** Adds a controllable `get()` failure: while armed via `setGetShouldThrow(true)`, every `get()` call throws instead of resolving, simulating a store outage. */
+class ThrowingGetStore extends VersionedAtomicStore {
+  private getShouldThrow = false;
+
+  setGetShouldThrow(value: boolean): void {
+    this.getShouldThrow = value;
+  }
+
+  async get<T>(key: string): Promise<T | null> {
+    if (this.getShouldThrow) throw new Error('simulated store outage');
+    return super.get<T>(key);
+  }
+}
+
 class UnreachableStore implements Store {
   async get<T>(): Promise<T | null> {
     throw new Error('ECONNREFUSED');
@@ -1312,6 +1360,221 @@ describe('CircuitBreaker (distributed mode, closed-state local cache)', () => {
     await expect(breaker.execute('op-b', succeed)).resolves.toBe('ok');
 
     expect(getSpy).toHaveBeenCalledTimes(2); // both entries untrusted -- both calls perform a real read
+    breaker.destroy();
+  });
+
+  it('the closed cache recovers after its underlying key expires, instead of distrusting reality forever', async () => {
+    const store = new VersionedAtomicStore();
+    const breaker = new CircuitBreaker({ failureThreshold: 1, resetTimeout: 30, jitter: 0, store, localCache: { staleToleranceMs: 50 } });
+    await flushMicrotasks();
+
+    // Trip and recover once so the cached entry holds a real, positive
+    // version (mirroring closeAtomic's version: N after a real
+    // trip/recovery cycle) -- not the version: 0 a brand-new key would have.
+    await expect(breaker.execute('op', fail)).rejects.toThrow('boom');
+    await new Promise((resolve) => setTimeout(resolve, 40)); // past resetTimeout
+    await expect(breaker.execute('op', succeed)).resolves.toBe('ok'); // trial succeeds, closes -> version bumps
+
+    const stateAfterRecovery = await store.get<{ version: number }>('circuit_breaker:op');
+    expect(stateAfterRecovery!.version).toBeGreaterThan(0);
+
+    // Simulate the key's TTL expiring after a long idle period.
+    await store.del('circuit_breaker:op');
+    await new Promise((resolve) => setTimeout(resolve, 60)); // past staleToleranceMs -- cache no longer trusted-fresh
+
+    // Before the fix: a real read returning null (version 0) was blocked
+    // by the regression guard (0 < the cached entry's real version),
+    // leaving the cache permanently distrustful for this operation. Now
+    // reads always win.
+    await expect(breaker.execute('op', succeed)).resolves.toBe('ok');
+
+    const getSpy = jest.spyOn(store, 'get');
+    await expect(breaker.execute('op', succeed)).resolves.toBe('ok');
+    expect(getSpy).not.toHaveBeenCalled(); // cache is warm again -- fast path restored
+
+    breaker.destroy();
+  });
+
+  it('a transition event with version <= cached triggers a reconcile read instead of being silently dropped', async () => {
+    const store = new VersionedAtomicStore();
+    const breaker = new CircuitBreaker({ failureThreshold: 1, resetTimeout: 30, jitter: 0, store, localCache: { staleToleranceMs: 100 } });
+    await flushMicrotasks();
+
+    // Trip and recover once so the cached entry holds a real version > 1.
+    await expect(breaker.execute('op', fail)).rejects.toThrow('boom');
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    await expect(breaker.execute('op', succeed)).resolves.toBe('ok');
+
+    const getSpy = jest.spyOn(store, 'get');
+
+    // Simulate the key being reborn (e.g. TTL expiry) and re-tripped
+    // elsewhere, restarting its version sequence at 1 -- lower than what's
+    // cached, but a real transition, not a stale duplicate.
+    store.simulateRemoteTransition({ operation: 'op', version: 1, isOpen: true, lastFailure: Date.now(), openCount: 0 });
+    await flushMicrotasks();
+
+    expect(getSpy).toHaveBeenCalled(); // triggered a reconcile read instead of silently dropping the event
+
+    await expect(breaker.execute('op', succeed)).rejects.toThrow('Circuit breaker is open for operation: op'); // reconciled to the real (open) state
+    breaker.destroy();
+  });
+
+  it('a close event clears the open-state cache too, avoiding a reject-after-allow flip-flop once the closed-cache entry goes stale', async () => {
+    jest.useFakeTimers();
+    try {
+      const store = new VersionedAtomicStore();
+      const breaker = new CircuitBreaker({
+        failureThreshold: 1,
+        resetTimeout: 60000,
+        jitter: 0,
+        store,
+        localCache: { staleToleranceMs: 100 },
+        openCacheRefreshMs: 10000, // deliberately long -- a leftover cachedOpen entry would reject on this for a while if not cleared
+      });
+      await flushMicrotasks();
+
+      await expect(breaker.execute('op', fail)).rejects.toThrow('boom'); // trips locally: populates cachedOpen AND closedCache(isOpen:true)
+
+      // Another instance closes it elsewhere; this instance observes the transition.
+      store.simulateRemoteTransition({ operation: 'op', version: 10, isOpen: false, lastFailure: 0, openCount: 0 });
+      await flushMicrotasks();
+
+      // Immediately after: the closed-cache fast path allows.
+      await expect(breaker.execute('op', succeed)).resolves.toBe('ok');
+
+      // Past staleToleranceMs: without clearing cachedOpen on the close
+      // event, this would incorrectly reject for up to openCacheRefreshMs.
+      jest.advanceTimersByTime(150);
+      await expect(breaker.execute('op', succeed)).resolves.toBe('ok');
+
+      breaker.destroy();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('an open event populates the open-state cache directly, saving a read on the next call', async () => {
+    const store = new VersionedAtomicStore();
+    const breaker = new CircuitBreaker({ failureThreshold: 5, resetTimeout: 60000, store, localCache: { staleToleranceMs: 100 } });
+    await flushMicrotasks();
+
+    // Make the instance aware of the operation first (metrics.has(...) is
+    // the create-guard's proxy for "an operation this instance tracks") --
+    // an event for an operation never executed here is deliberately a
+    // no-op; see the "an event for an operation this instance never
+    // executed" test below.
+    await expect(breaker.execute('op', succeed)).resolves.toBe('ok');
+
+    store.simulateRemoteTransition({ operation: 'op', version: 1, isOpen: true, lastFailure: Date.now(), openCount: 0 });
+    await flushMicrotasks();
+
+    const getSpy = jest.spyOn(store, 'get');
+    await expect(breaker.execute('op', succeed)).rejects.toThrow('Circuit breaker is open for operation: op');
+    expect(getSpy).not.toHaveBeenCalled(); // rejected straight from the open-cache populated by the event, no read needed
+    breaker.destroy();
+  });
+
+  it('an event for an operation this instance never executed does not plant a cache entry', async () => {
+    const store = new VersionedAtomicStore();
+    const breaker = new CircuitBreaker({
+      failureThreshold: 5,
+      resetTimeout: 60000,
+      store,
+      localCache: { staleToleranceMs: 100 },
+      monitorInterval: 20,
+    });
+    await flushMicrotasks();
+
+    // 'never-called-op' is never executed by this instance -- only ever
+    // observed via the shared transition stream.
+    store.simulateRemoteTransition({ operation: 'never-called-op', version: 1, isOpen: true, lastFailure: Date.now(), openCount: 0 });
+    await flushMicrotasks();
+
+    const getSpy = jest.spyOn(store, 'get');
+    await new Promise((resolve) => setTimeout(resolve, 60)); // a few monitor() ticks
+
+    // If the event had planted a cache entry, the fallback poll would have
+    // issued a GET reconciling it by now.
+    expect(getSpy).not.toHaveBeenCalled();
+    breaker.destroy();
+  });
+
+  it('a stale in-flight read cannot overwrite a fresher push event that arrived while it was in flight', async () => {
+    const store = new DeferredGetStore();
+    const breaker = new CircuitBreaker({ failureThreshold: 1, resetTimeout: 30, jitter: 0, store, localCache: { staleToleranceMs: 50 } });
+    await flushMicrotasks();
+
+    // Trip and recover once so there's a real, persisted closed snapshot
+    // with a real version > 0 to use as the "stale" read result below.
+    await expect(breaker.execute('op', fail)).rejects.toThrow('boom');
+    await new Promise((resolve) => setTimeout(resolve, 40)); // past resetTimeout
+    await expect(breaker.execute('op', succeed)).resolves.toBe('ok'); // trial recovers it
+    const staleClosedSnapshot = await store.get<CircuitBreakerState>('circuit_breaker:op');
+    expect(staleClosedSnapshot).not.toBeNull();
+
+    await new Promise((resolve) => setTimeout(resolve, 60)); // past staleToleranceMs -- next call falls through to a real read
+
+    // Arm the store so the upcoming gate read defers instead of resolving,
+    // simulating a slow read that's still in flight.
+    store.armNextGetToDefer();
+    const staleReadCall = breaker.execute('op', succeed);
+    await flushMicrotasks(); // let the gate actually issue the (now-pending) get(), capturing readStartedAt
+
+    // Real wall-clock separation from the read's start: Date.now() is
+    // millisecond-resolution, and a real read against a real store never
+    // resolves in the same tick it was issued in, so this mirrors reality
+    // (network latency) rather than relying on winning a same-millisecond tie.
+    await new Promise((resolve) => setTimeout(resolve, 5));
+
+    // While that read is in flight, another instance trips the breaker;
+    // this instance observes the transition and installs a fresher, open entry.
+    store.simulateRemoteTransition({ operation: 'op', version: 999, isOpen: true, lastFailure: Date.now(), openCount: 0 });
+    await flushMicrotasks();
+
+    // Now the stale read finally resolves, with the OLD (pre-trip) closed
+    // snapshot -- this call itself is inherently stale and is let through
+    // (it read closed data before it knew otherwise), but it must not
+    // regress the *shared* cache back to closed for later calls.
+    store.resolveNextDeferredGetWith(staleClosedSnapshot);
+    await expect(staleReadCall).resolves.toBe('ok');
+
+    // A later call must still see the fresher, open state -- not
+    // overwritten by the stale read that resolved after it.
+    await expect(breaker.execute('op', succeed)).rejects.toThrow('Circuit breaker is open for operation: op');
+
+    breaker.destroy();
+  });
+
+  it('a reconcile that fails (store error) marks the entry untrusted instead of installing trusted-clean, preserving failOpenOnStoreError: false', async () => {
+    const store = new ThrowingGetStore();
+    const breaker = new CircuitBreaker({
+      failureThreshold: 1,
+      resetTimeout: 60000,
+      jitter: 0,
+      store,
+      localCache: { staleToleranceMs: 50 },
+      failOpenOnStoreError: false,
+    });
+    await flushMicrotasks();
+
+    // Warm the cache with a real, trusted-closed snapshot (version 0).
+    await expect(breaker.execute('op', succeed)).resolves.toBe('ok');
+
+    // Simulate a store outage, then trigger a reconcile the same way a
+    // reborn key's event (or the fallback poll) would: a transition whose
+    // version doesn't exceed what's cached.
+    store.setGetShouldThrow(true);
+    store.simulateRemoteTransition({ operation: 'op', version: 0, isOpen: false, lastFailure: 0, openCount: 0 });
+    await flushMicrotasks();
+
+    await new Promise((resolve) => setTimeout(resolve, 60)); // past staleToleranceMs, for good measure
+
+    // failOpenOnStoreError: false means an untrusted cache must fall
+    // through to a real read -- which is the (still failing) store, so
+    // StoreUnavailableError, not a silently-served allow from a cache
+    // entry the failed reconcile should never have been allowed to trust.
+    await expect(breaker.execute('op', succeed)).rejects.toBeInstanceOf(StoreUnavailableError);
+
     breaker.destroy();
   });
 });

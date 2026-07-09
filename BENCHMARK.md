@@ -14,8 +14,8 @@ Results from `bench/index.js` (`npm run bench`), run against a real Redis. This 
 
 Three configurations, each against a freshly flushed DB, `strategy: 'consecutive'`:
 
-1. **baseline** — approximates pre-Release-1/2/3: `closeAtomic`/`reopenTrialFailureAtomic`/`subscribeTransitions` stripped from the store (so `closeDistributed`/`reopenAfterFailedTrialDistributed` use their non-atomic get-then-set fallback), `openCacheRefreshMs: 0` (no open-state cache).
-2. **release1+2 (today's default)** — full `RedisStore`, `localCache` unset. Gets the healthy-path write-skip (Release 1, which is unconditional, not opt-in) and the open-state rejection cache (Release 2, `openCacheRefreshMs` default 2000ms).
+1. **no-cache** — neither local cache: `closeAtomic`/`reopenTrialFailureAtomic`/`subscribeTransitions` stripped from the store (so `closeDistributed`/`reopenAfterFailedTrialDistributed` use their non-atomic get-then-set fallback), `openCacheRefreshMs: 0` (no open-state cache), `localCache` unset (no closed-state cache). **Not** a pre-Release-1 baseline — the healthy-path write-skip lives unconditionally in the breaker core, not behind any capability or option, so this config has it too (see its own `set` count below). A true pre-Release-1 run isn't reproducible through configuration at all; it would show one `set` per healthy call instead of effectively zero.
+2. **release1+2 (today's default)** — full `RedisStore`, `localCache` unset. Gets the open-state rejection cache (Release 2, `openCacheRefreshMs` default 2000ms) on top of the write-skip both configs already have.
 3. **+localCache (Release 3)** — same as above, plus `localCache: { staleToleranceMs: 100 }`.
 
 Workload per config:
@@ -29,26 +29,27 @@ Reported per config: total `Store`-level calls (`CountingStore` wraps the real `
 
 | Config | Total store ops | Healthy p50 / p99 | Rejection p50 / p99 (n) | Post-recovery p50 / p99 |
 |---|---|---|---|---|
-| baseline | 20,037 | 0.356ms / 0.967ms | 0.415ms / 1.358ms (9,823) | 0.449ms / 1.015ms |
-| release1+2 (default) | 10,217 | 0.370ms / 1.039ms | 0.010ms / 0.032ms (418,154) | 0.362ms / 1.345ms |
-| +localCache | **13** | **0.002ms** / 0.023ms | 0.009ms / 0.026ms (483,436) | **0.001ms** / 0.001ms |
+| no-cache | 20,267 | 0.371ms / 1.323ms | 0.405ms / 1.345ms (10,053) | 0.506ms / 1.463ms |
+| release1+2 (default) | 10,216 | 0.357ms / 1.117ms | 0.010ms / 0.033ms (411,103) | 0.410ms / 1.060ms |
+| +localCache | **14** | **0.001ms** / 0.004ms | 0.009ms / 0.029ms (464,042) | **0.001ms** / 0.002ms |
 
 Ops by method, for reference:
 
 ```
-baseline:     { get: 20029, set: 1, recordFailureAtomic: 5, claimTrial: 1, releaseTrial: 1 }
-release1+2:   { get: 10209, recordFailureAtomic: 5, claimTrial: 1, releaseTrial: 1, closeAtomic: 1 }
-+localCache:  { get: 4, recordFailureAtomic: 5, claimTrial: 1, releaseTrial: 1, closeAtomic: 1, subscribeTransitions: 1 }
+no-cache:     { get: 20259, set: 1, recordFailureAtomic: 5, claimTrial: 1, releaseTrial: 1 }
+release1+2:   { get: 10208, recordFailureAtomic: 5, claimTrial: 1, releaseTrial: 1, closeAtomic: 1 }
++localCache:  { get: 5, recordFailureAtomic: 5, claimTrial: 1, releaseTrial: 1, closeAtomic: 1, subscribeTransitions: 1 }
 ```
 
-(`recordFailureAtomic`, `claimTrial`, `releaseTrial`, `closeAtomic`, `subscribeTransitions` counts are identical across the two non-baseline configs — they come from the fixed 5-failure trip + one trial recovery + one subscription setup that every config's incident script does once, not from the 10,000-call healthy loop. The whole story is in `get` and, for baseline, the once-per-run `set`.)
+(`recordFailureAtomic`, `claimTrial`, `releaseTrial`, `closeAtomic`, `subscribeTransitions` counts are identical across the two non-`no-cache` configs — they come from the fixed 5-failure trip + one trial recovery + one subscription setup that every config's incident script does once, not from the 10,000-call healthy loop. The whole story is in `get` and, for `no-cache`, the once-per-run `set`.)
 
 ## Reading the numbers
 
-- **Healthy path, baseline vs. release1+2**: `get` count is roughly halved (20,029 → 10,209) purely from Release 1's write-skip — a `set` almost never happens against an already-clean key (baseline: 1 total `set` across the whole run), so the *reads* were already the dominant cost even before `localCache`; `release1+2` doesn't reduce them at all (a real `store.get` still runs on every healthy call). Healthy-path latency is close to identical between the two (~0.35-0.37ms p50) because both still pay one network round trip per call — the difference between them is invisible on this axis and only shows up in the op count.
-- **Healthy path, release1+2 vs. +localCache**: `get` drops from 10,209 to 4 (the 4 are the cache's own warm-up read plus the fallback-poll's occasional reconciliation reads, not one per call) — a **~2,500x** reduction in store ops for the healthy path specifically. Latency follows: p50 drops from 0.370ms to 0.002ms, roughly **185x**, because the fast path is now a local map lookup with zero network involvement.
-- **Rejection path (the incident hold)**: this is where release1+2's open-state cache does its job, independent of `localCache` — both non-baseline configs show p50 ≈ 0.01ms during the 5-second hold, a **~40x** drop from baseline's 0.415ms, and the incident absorbed 418k-483k calls in the same 5-second window once rejections stopped costing a round trip (vs. 9,823 for baseline, which is network-bound the whole time). This is the "load during an incident should be lowest, not highest" claim, and it doesn't require `localCache` — `openCacheRefreshMs` alone gets you this.
-- **13 total ops for the entire +localCache run** (10,000 healthy calls + a full incident + recovery + 200 more calls) is the headline number: `consecutive` genuinely reaches a 0-store-op steady state once the cache is warm, exactly as designed.
+- **`no-cache`'s own `set` count (1, not ~10,000) already shows the write-skip is in effect** — it isn't behind any option this benchmark toggles, so all three configs have it. Don't read this table as "write-skip vs. no write-skip"; all three rows already reflect it.
+- **Healthy path, `no-cache` vs. release1+2**: `get` count is roughly halved (20,259 → 10,208) — that gap (≈10,051) is almost exactly `no-cache`'s rejection-path call count (10,053). This is the Release 2 open-state cache eliminating a store read on every *rejected* call during the incident hold, not anything about the healthy path itself: `release1+2` still does a real `store.get` on every single healthy call, identically to `no-cache`. Healthy-path latency confirms this — both are ~0.36-0.37ms p50, statistically indistinguishable, because both still pay one network round trip per healthy call. The difference between these two configs is invisible on the healthy-path axis and only shows up in the rejection-path numbers below.
+- **Healthy path, release1+2 vs. +localCache**: `get` drops from 10,208 to 5 (a handful of the cache's own warm-up read plus the fallback-poll's occasional reconciliation reads, not one per call) — a **~2,000x** reduction in store ops for the healthy path specifically, and this *is* `localCache`'s doing (it's the only config of the three that touches the healthy-path read at all). Latency follows: p50 drops from 0.357ms to 0.001ms, over **300x**, because the fast path is now a local map lookup with zero network involvement.
+- **Rejection path (the incident hold)**: this is where release1+2's open-state cache does its job, independent of `localCache` — both non-`no-cache` configs show p50 ≈ 0.01ms during the 5-second hold, a **~40x** drop from `no-cache`'s 0.405ms, and the incident absorbed 411k-464k calls in the same 5-second window once rejections stopped costing a round trip (vs. 10,053 for `no-cache`, which is network-bound the whole time). This is the "load during an incident should be lowest, not highest" claim, and it doesn't require `localCache` — `openCacheRefreshMs` alone gets you this.
+- **14 total ops for the entire +localCache run** (10,000 healthy calls + a full incident + recovery + 200 more calls) is the headline number: `consecutive` genuinely reaches a 0-store-op steady state once the cache is warm, exactly as designed. Read this as *decoupled from request volume* (at most one read per `staleToleranceMs` window under sustained load, plus one poll per idle operation every ~5s), not as a literal universal constant — this run-to-run count (13, 14, ...) is partly an artifact of the run fitting inside a handful of staleness/poll windows; a longer or higher-concurrency run would show a few more, still bounded, still nothing like one-per-call.
 
 ## Reproducing
 

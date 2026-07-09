@@ -4,11 +4,14 @@
 /**
  * Benchmarks three distributed-mode configurations against a real Redis:
  *
- *   1. "baseline"    -- pre-Release-1/2/3: no closeAtomic/reopenTrialFailureAtomic/
- *                       subscribeTransitions, openCacheRefreshMs disabled. Every
- *                       gate check reads the store; every healthy success writes.
- *   2. "release1+2"  -- today's default: the healthy-path write skip (Release 1)
- *                       and the open-state cache (Release 2), localCache off.
+ *   1. "no-cache"    -- neither local cache: no closeAtomic/reopenTrialFailureAtomic/
+ *                       subscribeTransitions, openCacheRefreshMs disabled, localCache
+ *                       unset. Every gate check reads the store. NOT a pre-Release-1
+ *                       baseline: the healthy-path write skip lives unconditionally in
+ *                       the breaker core, not behind any option here, so this config
+ *                       has it too (see its own near-zero `set` count in the report).
+ *   2. "release1+2"  -- today's default: the open-state cache (Release 2) on top of
+ *                       the write skip both configs already have, localCache off.
  *   3. "localCache"  -- release1+2 plus the closed-state local cache (Release 3),
  *                       opt-in via `localCache: { staleToleranceMs: 100 }`.
  *
@@ -88,14 +91,16 @@ class CountingStore {
 
 /**
  * A plain object forwarding only the pre-Release-3 capabilities of a real
- * RedisStore, approximating the pre-Release-1/2/3 baseline. Deliberately a
- * fresh object (not a prototype trick) -- closeAtomic/reopenTrialFailureAtomic/
+ * RedisStore, for the "no-cache" config. Deliberately a fresh object (not a
+ * prototype trick) -- closeAtomic/reopenTrialFailureAtomic/
  * subscribeTransitions are simply absent, which is what `if (store.closeAtomic)`
  * checks throughout circuit-breaker.ts key off of. Non-atomic get-then-set
  * fallbacks are what actually run for closes/reopens here, same as real
- * old-fleet coexistence.
+ * old-fleet coexistence. Note this does NOT disable the healthy-path write
+ * skip (Release 1) -- that lives unconditionally in the breaker core, not
+ * behind any store capability, so this config has it too.
  */
-function stripToBaseline(store) {
+function stripToNoCache(store) {
   return {
     get: store.get.bind(store),
     set: store.set.bind(store),
@@ -186,9 +191,10 @@ function printReport(results) {
     console.log('');
   }
 
-  console.log('Ops-per-healthy-call and rejection-path latency are the two numbers to compare across configs --');
-  console.log('release1+2 should show ~1 op/call instead of ~2 for baseline; localCache should approach 0 ops/call');
-  console.log('on the healthy path once its cache is warm, and near-0 rejection latency during the incident hold.\n');
+  console.log('Rejection-path latency and healthy-path ops-per-call are the two numbers to compare across configs --');
+  console.log('release1+2 should show ~0 rejection latency vs. no-cache paying a full round trip per rejected call');
+  console.log('(that is what halves its total op count too); localCache should additionally approach 0 ops/call');
+  console.log('on the healthy path once its cache is warm.\n');
 }
 
 async function main() {
@@ -211,9 +217,9 @@ async function main() {
 
   results.push(
     await benchConfig(
-      'baseline (pre-Release-1/2/3)',
+      'no-cache',
       redis,
-      () => stripToBaseline(new RedisStore(redis, { keyPrefix: 'redeye-bench:' })),
+      () => stripToNoCache(new RedisStore(redis, { keyPrefix: 'redeye-bench:' })),
       { openCacheRefreshMs: 0 },
     ),
   );

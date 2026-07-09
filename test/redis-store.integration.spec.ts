@@ -443,4 +443,39 @@ describe('CircuitBreaker + RedisStore, localCache (integration)', () => {
 
     breaker.destroy();
   });
+
+  it('the closed cache recovers after its underlying key is force-expired (TTL), instead of getting stuck distrusting reality', async () => {
+    const breaker = new CircuitBreaker({
+      failureThreshold: 1,
+      resetTimeout: 30,
+      jitter: 0,
+      store,
+      localCache: { staleToleranceMs: 50 },
+    });
+
+    await expect(breaker.execute('op', fail)).rejects.toThrow('boom'); // opens
+    await new Promise((resolve) => setTimeout(resolve, 60)); // past resetTimeout
+    await expect(breaker.execute('op', succeed)).resolves.toBe('ok'); // trial recovers it -> real, positive version
+
+    const key = 'redeye-test:circuit_breaker:op';
+    expect(await redis.get(key)).not.toBeNull();
+
+    // Force the state key to expire almost immediately, simulating a long
+    // idle period after recovery reaching the real (generous) state TTL,
+    // without waiting the real ~180s out.
+    await redis.pexpire(key, 50);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(await redis.get(key)).toBeNull(); // confirm it actually expired
+
+    await new Promise((resolve) => setTimeout(resolve, 60)); // past staleToleranceMs too
+
+    // Before the fix: a real read returning null (version 0) was blocked
+    // by the regression guard from overwriting a cache entry holding a
+    // real, higher version -- leaving this operation permanently stuck
+    // reading the store every call, distrusting a reality it never
+    // re-observed. Now reads always win.
+    await expect(breaker.execute('op', succeed)).resolves.toBe('ok');
+
+    breaker.destroy();
+  });
 });

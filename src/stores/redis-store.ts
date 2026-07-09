@@ -442,6 +442,15 @@ export class RedisStore implements Store {
     conn.client('SETNAME', 'redeye-subscriber').catch(() => {});
 
     let stopped = false;
+    // '$' means "only entries added after this XREAD actually starts
+    // blocking on the server" -- there's an inherent gap between this call
+    // returning (the subscription is "set up" from the caller's
+    // perspective) and that blocking read actually being registered, during
+    // which a transition published by another instance is simply never
+    // seen by this subscriber. This is bounded and covered, not a bug to
+    // fix here: the closed-state cache's own fallback poll (in
+    // CircuitBreaker.monitor()) and staleToleranceMs both exist precisely
+    // to catch a missed message regardless of why it was missed.
     let lastId = '$';
 
     // ioredis auto-reconnects by default, and can do so transparently enough
