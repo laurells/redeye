@@ -1,5 +1,5 @@
 import { Store } from './store';
-import { CircuitBreakerState, CircuitMetrics, CLOSED_STATE, emptyMetrics } from './types';
+import { CircuitBreakerState, CircuitMetrics, CLOSED_STATE, emptyMetrics, TransitionEvent } from './types';
 
 export type CircuitState = 'closed' | 'open' | 'half-open';
 
@@ -8,7 +8,7 @@ export interface BreakerLogger {
   log(message: string): void;
 }
 
-export type { CircuitBreakerState, CircuitMetrics };
+export type { CircuitBreakerState, CircuitMetrics, TransitionEvent };
 
 /**
  * Thrown in distributed mode when the backing store is unreachable and
@@ -132,6 +132,30 @@ export interface CircuitBreakerOptions {
    * Default: 2000.
    */
   openCacheRefreshMs?: number;
+  /**
+   * Distributed mode, opt-in. Serves gate decisions for CLOSED state from a
+   * local cache while it's fresher than `staleToleranceMs`, invalidated
+   * push-style via the store's transition stream (`Store.subscribeTransitions`)
+   * instead of polling — so a healthy call can skip the store read entirely,
+   * not just the write Release 1 already skips.
+   *
+   * This only ever short-circuits an *allow*: a cache entry observed open
+   * always defers to the open-state cache (`openCacheRefreshMs`) and a real
+   * read, which remains authoritative for all rejection handling. Requires
+   * a store implementing `subscribeTransitions`; without one, this option
+   * is a no-op (one-time warning) and behavior is unchanged from not
+   * setting it at all.
+   *
+   * The worst case is a bounded fail-open window: if the breaker trips
+   * elsewhere in the fleet, a calls still landing on a cached entry can be
+   * let through for up to `staleToleranceMs` plus however long the
+   * transition event takes to arrive — never longer, since the cache entry
+   * expires against `staleToleranceMs` on its own regardless of whether the
+   * event ever arrives. See the README's local caching section for the
+   * full fail-open/fail-closed asymmetry this creates versus the
+   * (fail-closed-biased) open-state cache.
+   */
+  localCache?: { staleToleranceMs?: number };
 }
 
 const noopLogger: BreakerLogger = { warn: () => {}, log: () => {} };
@@ -156,6 +180,17 @@ interface Gate {
    * callers must NOT assume clean state in that case.
    */
   observedState?: CircuitBreakerState | null;
+  /**
+   * True when the gate was served entirely from the closed-state local
+   * cache (`localCache`) with zero store reads. Distinct from
+   * `observedState` — no real read happened, so there's nothing to put
+   * there — but for the purposes of the healthy-path write skip
+   * (Release 1's `observedClean` check), a fresh, trusted cache hit is
+   * treated as clean: this is the tradeoff that gets `consecutive` to a
+   * genuine 0-round-trip healthy path, accepting the same bounded
+   * staleness the cache read itself already accepted.
+   */
+  assumeClean?: boolean;
 }
 
 /**
@@ -185,6 +220,7 @@ export class CircuitBreaker {
       | 'trialTimeout'
       | 'maxResetTimeout'
       | 'maxOperations'
+      | 'localCache'
     >
   > & {
     onStateChange?: (state: CircuitState, operation: string) => void;
@@ -195,6 +231,7 @@ export class CircuitBreaker {
     trialTimeout: number;
     maxResetTimeout: number;
     maxOperations?: number;
+    localCache?: { staleToleranceMs: number };
   };
 
   private readonly distributed: boolean;
@@ -216,6 +253,23 @@ export class CircuitBreaker {
    * an early close by another instance or a manual `reset()`.
    */
   private readonly cachedOpen = new Map<string, { lastFailure: number; openCount: number; expiresAt: number; lastRefetch: number }>();
+
+  /** Fixed, unprefixed key for the shared transition-event stream — one per store/prefix, not one per operation. `RedisStore` applies its own `keyPrefix` the same way it does for every other key this class hands it. */
+  private readonly eventsKey = 'circuit_breaker:events';
+  /**
+   * Distributed mode only, `localCache` opt-in: a local, push-invalidated
+   * record of the last known state for `operation`, used to serve gate
+   * decisions for CLOSED state with zero store reads while fresh and
+   * trusted. `trusted: false` means the last write we saw for this entry
+   * had no `version` (unknown provenance — an older library version wrote
+   * it) or the transition subscription itself dropped; either way, the
+   * gate must not use it and instead performs a real read next time,
+   * which re-establishes trust.
+   */
+  private readonly closedCache = new Map<string, { state: CircuitBreakerState; version: number; fetchedAt: number; trusted: boolean }>();
+  /** True once `subscribeTransitions` has actually succeeded; false (the closed cache is never consulted) if `localCache` wasn't set, the store lacks the capability, or the initial subscribe attempt failed. */
+  private localCacheActive = false;
+  private unsubscribeTransitions?: () => void;
 
   // local mode state
   private readonly failures = new Map<string, number>();
@@ -251,17 +305,96 @@ export class CircuitBreaker {
       logger: options.logger ?? noopLogger,
       maxOperations: options.maxOperations,
       openCacheRefreshMs: options.openCacheRefreshMs ?? 2000,
+      localCache: options.localCache ? { staleToleranceMs: options.localCache.staleToleranceMs ?? 100 } : undefined,
     };
 
     this.distributed = !!options.store;
 
     this.monitorHandle = setInterval(() => this.monitor(), this.options.monitorInterval);
     this.monitorHandle.unref?.();
+
+    if (this.distributed && this.options.localCache) {
+      void this.setupLocalCache();
+    }
   }
 
-  /** Stops the local-mode monitor interval. Call this when the breaker is no longer needed. */
+  /**
+   * Attempts to establish the closed-state cache's push invalidation via
+   * `Store.subscribeTransitions`. Best-effort and one-shot: if the store
+   * doesn't implement it, or the initial subscribe attempt itself throws,
+   * `localCache` stays disabled for this breaker's lifetime (a one-time
+   * warning either way) — reconnects *after* a successful subscription are
+   * the store implementation's own responsibility (see the interface doc).
+   */
+  private async setupLocalCache(): Promise<void> {
+    const store = this.options.store!;
+    if (!store.subscribeTransitions) {
+      this.options.logger.warn(
+        'localCache is set but the store does not implement subscribeTransitions(); the closed-state cache stays disabled (falling back to open-cache-only behavior). See README.',
+      );
+      return;
+    }
+    try {
+      this.unsubscribeTransitions = await store.subscribeTransitions(this.eventsKey, (event) => this.handleTransitionEvent(event));
+      this.localCacheActive = true;
+    } catch (error) {
+      this.options.logger.warn(
+        `localCache is set but subscribing to transition events failed; the closed-state cache stays disabled: ${(error as Error)?.message ?? error}`,
+      );
+    }
+  }
+
+  /**
+   * `null` means the subscription's connection dropped or errored: every
+   * cached entry may now be missing events, so all of them are marked
+   * untrusted until their next authoritative (real-read) refresh — the
+   * fallback poll in `monitor()` is what eventually forces that refresh if
+   * no call happens to trigger one first.
+   */
+  private handleTransitionEvent(event: TransitionEvent | null): void {
+    if (event === null) {
+      for (const entry of this.closedCache.values()) entry.trusted = false;
+      return;
+    }
+    const existing = this.closedCache.get(event.operation);
+    if (existing && event.version <= existing.version) return; // stale/duplicate delivery -- ignore
+    this.closedCache.set(event.operation, {
+      state: { ...CLOSED_STATE, isOpen: event.isOpen, lastFailure: event.lastFailure, openCount: event.openCount, version: event.version },
+      version: event.version,
+      fetchedAt: Date.now(),
+      trusted: true,
+    });
+  }
+
+  /**
+   * Refreshes the closed-state cache entry for `operation` with a fresh
+   * authoritative read, whether the write came from this instance (already
+   * has the resulting state in hand) or a real gate read. A no-op if
+   * `localCache` isn't active. Never regresses a cache entry that a newer
+   * transition event has already superseded, since a real read can race a
+   * push notification and land after it.
+   */
+  private updateClosedCache(operation: string, state: CircuitBreakerState | null): void {
+    if (!this.localCacheActive) return;
+    // null (never written) is unambiguously clean, same as CLOSED_STATE's
+    // own version: 0 -- distrust is for a *stored* object that predates the
+    // version field, not for "nothing has ever been written here."
+    const trusted = state === null || state.version !== undefined;
+    const version = state?.version ?? 0;
+    const existing = this.closedCache.get(operation);
+    if (trusted && existing?.trusted && version < existing.version) return; // don't regress past a newer stream event
+    this.closedCache.set(operation, {
+      state: state ?? { ...CLOSED_STATE },
+      version,
+      fetchedAt: Date.now(),
+      trusted,
+    });
+  }
+
+  /** Stops the local-mode monitor interval and any transition-event subscription. Call this when the breaker is no longer needed. */
   destroy(): void {
     clearInterval(this.monitorHandle);
+    this.unsubscribeTransitions?.();
   }
 
   async execute<T>(operation: string, fn: () => Promise<T>): Promise<T> {
@@ -397,6 +530,7 @@ export class CircuitBreaker {
       await this.safeDelTrial(operation);
       this.cachedResetTimeouts.delete(operation);
       this.cachedOpen.delete(operation);
+      this.closedCache.delete(operation);
       if (prior?.isOpen) {
         this.options.onStateChange?.('closed', operation);
       }
@@ -498,6 +632,18 @@ export class CircuitBreaker {
     return Math.max(1, Math.ceil((this.backoffCapped(openCount) * 3) / 1000));
   }
 
+  /**
+   * Same generous, non-load-bearing safety-net TTL as `stateTtlSeconds`, for
+   * the one call site (`reopenTrialFailureAtomic`) that must pick a TTL
+   * *before* knowing the resulting `openCount` the atomic script itself
+   * computes server-side. Sized off `maxResetTimeout` — the ceiling
+   * `backoffCapped` can ever reach at any `openCount` — so it's always at
+   * least as generous as the true per-`openCount` value would be.
+   */
+  private maxStateTtlSeconds(): number {
+    return Math.max(1, Math.ceil((this.options.maxResetTimeout * 3) / 1000));
+  }
+
   private trialTtlSeconds(): number {
     return Math.max(1, Math.ceil(this.options.trialTimeout / 1000));
   }
@@ -508,7 +654,9 @@ export class CircuitBreaker {
     this.options.onStoreError?.(error, operation);
   }
 
-  private warnMissingCapability(capability: 'recordFailureAtomic' | 'recordOutcomeAtomic' | 'claimTrial' | 'releaseTrial'): void {
+  private warnMissingCapability(
+    capability: 'recordFailureAtomic' | 'recordOutcomeAtomic' | 'claimTrial' | 'releaseTrial' | 'closeAtomic' | 'reopenTrialFailureAtomic',
+  ): void {
     if (this.warnedCapabilities.has(capability)) return;
     this.warnedCapabilities.add(capability);
     this.options.logger.warn(
@@ -582,9 +730,28 @@ export class CircuitBreaker {
   }
 
   private async closeDistributed(operation: string): Promise<void> {
+    if (this.options.store!.closeAtomic) {
+      try {
+        const next = await this.options.store!.closeAtomic(this.key(operation), this.eventsKey, {
+          ttlSeconds: this.stateTtlSeconds(0),
+          operation,
+        });
+        this.cachedResetTimeouts.delete(operation);
+        this.cachedOpen.delete(operation);
+        this.updateClosedCache(operation, next);
+        return;
+      } catch (error) {
+        this.reportStoreError(error, operation);
+        // fall through to non-atomic fallback below
+      }
+    } else {
+      this.warnMissingCapability('closeAtomic');
+    }
+
     await this.safeSet(operation, { ...CLOSED_STATE }, this.stateTtlSeconds(0));
     this.cachedResetTimeouts.delete(operation);
     this.cachedOpen.delete(operation);
+    this.updateClosedCache(operation, { ...CLOSED_STATE });
   }
 
   /**
@@ -594,6 +761,16 @@ export class CircuitBreaker {
    * `canExecuteAsync`) is read-only and never claims.
    */
   private async gateDistributed(operation: string, claim: boolean): Promise<Gate> {
+    if (this.localCacheActive) {
+      const entry = this.closedCache.get(operation);
+      if (entry && entry.trusted && !entry.state.isOpen && Date.now() - entry.fetchedAt < this.options.localCache!.staleToleranceMs) {
+        return { allowed: true, isTrial: false, assumeClean: true };
+      }
+      // entry.state.isOpen, stale, untrusted, or absent -- defer entirely to
+      // the open-state cache / a real read below, which remain
+      // authoritative for all open/rejection handling.
+    }
+
     const cached = this.cachedOpen.get(operation);
     if (cached && this.options.openCacheRefreshMs > 0) {
       const now = Date.now();
@@ -618,6 +795,8 @@ export class CircuitBreaker {
       if (this.options.failOpenOnStoreError) return { allowed: true, isTrial: false };
       throw new StoreUnavailableError(operation, error);
     }
+
+    this.updateClosedCache(operation, state); // every real read refreshes the closed cache too, whatever it finds
 
     if (!state?.isOpen) {
       this.cachedOpen.delete(operation);
@@ -673,15 +852,19 @@ export class CircuitBreaker {
       } else {
         // consecutive strategy, non-trial success: only write if the gate
         // positively observed dirty state. If the read errored
-        // (observedState undefined), write anyway — we can't know.
+        // (observedState undefined), write anyway — we can't know. A
+        // closed-cache fast-pathed gate (`assumeClean`) skips the write
+        // too, accepting the same bounded staleness the 0-read cache hit
+        // itself already accepted -- this is what gets `consecutive` to a
+        // genuine 0-round-trip healthy path.
         //
         // Race analysis: if a concurrent failure lands between our gate
-        // read and this skipped write, not writing preserves that failure
-        // count — strictly safer than the old unconditional
+        // read (or cache hit) and this skipped write, not writing preserves
+        // that failure count — strictly safer than the old unconditional
         // `closeDistributed`, which could erase a legitimate concurrent
         // increment by overwriting it with CLOSED_STATE.
         const s = gate.observedState;
-        const observedClean = s !== undefined && (s === null || (!s.isOpen && s.failures === 0));
+        const observedClean = gate.assumeClean || (s !== undefined && (s === null || (!s.isOpen && s.failures === 0)));
         if (!observedClean) {
           await this.closeDistributed(operation);
         }
@@ -708,9 +891,11 @@ export class CircuitBreaker {
           ttlSeconds: this.stateTtlSeconds(0),
           failureThreshold: this.options.failureThreshold,
           now: Date.now(),
+          operation,
         });
         this.options.logger.warn(`Recorded failure for operation: ${operation}, total failures: ${next.failures}`);
         if (next.isOpen) this.cacheOpenState(operation, next);
+        this.updateClosedCache(operation, next);
         if (next.isOpen && next.failures === this.options.failureThreshold) {
           this.options.logger.warn(`Circuit breaker opened for operation: ${operation}`);
           this.options.onStateChange?.('open', operation);
@@ -740,6 +925,7 @@ export class CircuitBreaker {
     };
     await this.safeSet(operation, next, this.stateTtlSeconds(0));
     if (next.isOpen) this.cacheOpenState(operation, next);
+    this.updateClosedCache(operation, next);
     this.options.logger.warn(`Recorded failure for operation: ${operation}, total failures: ${next.failures}`);
 
     if (next.isOpen && !current.isOpen) {
@@ -763,8 +949,10 @@ export class CircuitBreaker {
           errorRateThreshold: this.options.errorRateThreshold,
           ttlSeconds: this.stateTtlSeconds(0),
           now: Date.now(),
+          operation,
         });
         if (next.isOpen) this.cacheOpenState(operation, next);
+        this.updateClosedCache(operation, next);
         if (next.openedNow) {
           this.options.logger.warn(
             `Circuit breaker opened for operation: ${operation} (error rate ${(next.errorRate * 100).toFixed(1)}% over ${next.sampleCount} calls)`,
@@ -796,6 +984,7 @@ export class CircuitBreaker {
     };
     await this.safeSet(operation, next, this.stateTtlSeconds(0));
     if (isOpen) this.cacheOpenState(operation, next);
+    this.updateClosedCache(operation, next);
 
     if (isOpen && !current.isOpen) {
       this.options.logger.warn(
@@ -806,6 +995,27 @@ export class CircuitBreaker {
   }
 
   private async reopenAfterFailedTrialDistributed(operation: string): Promise<void> {
+    if (this.options.store!.reopenTrialFailureAtomic) {
+      try {
+        const next = await this.options.store!.reopenTrialFailureAtomic(this.key(operation), this.eventsKey, {
+          ttlSeconds: this.maxStateTtlSeconds(),
+          failureThreshold: this.options.failureThreshold,
+          now: Date.now(),
+          operation,
+        });
+        this.cacheOpenState(operation, next);
+        this.updateClosedCache(operation, next);
+        this.options.logger.warn(`Half-open trial failed for operation: ${operation}; backing off (attempt ${next.openCount + 1})`);
+        this.options.onStateChange?.('open', operation);
+        return;
+      } catch (error) {
+        this.reportStoreError(error, operation);
+        // fall through to non-atomic fallback below
+      }
+    } else {
+      this.warnMissingCapability('reopenTrialFailureAtomic');
+    }
+
     const current = (await this.safeGet(operation)) ?? { ...CLOSED_STATE, isOpen: true };
     const openCount = (current.openCount ?? 0) + 1;
     const next: CircuitBreakerState = {
@@ -818,6 +1028,7 @@ export class CircuitBreaker {
     };
     await this.safeSet(operation, next, this.stateTtlSeconds(openCount));
     this.cacheOpenState(operation, next); // this instance authored the open state; cache it
+    this.updateClosedCache(operation, next);
     this.options.logger.warn(`Half-open trial failed for operation: ${operation}; backing off (attempt ${openCount + 1})`);
     this.options.onStateChange?.('open', operation);
   }
@@ -976,6 +1187,26 @@ export class CircuitBreaker {
         );
       }
     }
+
+    // Missed-message safety net for the closed-state cache: transitions are
+    // normally learned about push-style via subscribeTransitions, but a
+    // dropped stream message (or a subscription gap) would otherwise leave
+    // a cache entry stale forever. In steady state this is the only
+    // background traffic the closed-state cache generates -- one GET per
+    // stale operation per monitor tick, not per call.
+    if (this.distributed && this.localCacheActive) {
+      const pollAgeMs = 5000;
+      for (const [operation, entry] of this.closedCache.entries()) {
+        if (now - entry.fetchedAt > pollAgeMs) {
+          void this.reconcileClosedCache(operation);
+        }
+      }
+    }
+  }
+
+  private async reconcileClosedCache(operation: string): Promise<void> {
+    const state = await this.safeGet(operation);
+    this.updateClosedCache(operation, state);
   }
 
   // ---- shared -------------------------------------------------------------

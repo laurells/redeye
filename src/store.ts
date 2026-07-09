@@ -1,4 +1,4 @@
-import { CircuitBreakerState } from './types';
+import { CircuitBreakerState, TransitionEvent } from './types';
 
 export interface Store {
   get<T>(key: string): Promise<T | null>;
@@ -15,7 +15,7 @@ export interface Store {
    */
   recordFailureAtomic?(
     key: string,
-    opts: { ttlSeconds: number; failureThreshold: number; now: number },
+    opts: { ttlSeconds: number; failureThreshold: number; now: number; operation: string },
   ): Promise<CircuitBreakerState>;
 
   /**
@@ -67,6 +67,74 @@ export interface Store {
    */
   recordOutcomeAtomic?(
     key: string,
-    opts: { success: boolean; decay: number; minimumCalls: number; errorRateThreshold: number; ttlSeconds: number; now: number },
+    opts: {
+      success: boolean;
+      decay: number;
+      minimumCalls: number;
+      errorRateThreshold: number;
+      ttlSeconds: number;
+      now: number;
+      operation: string;
+    },
   ): Promise<CircuitBreakerState & { openedNow: boolean }>;
+
+  /**
+   * Atomically closes `key`, but only if it wasn't already clean (open, or
+   * had accumulated failures) — a no-op, no-write "return the current
+   * state" when it was already closed with nothing to clear. Bumps
+   * `version` and publishes a transition event to `eventsKey` when it does
+   * write. This is what lets `closeDistributed` skip a write on the healthy
+   * path *atomically* (server-side), rather than relying on the caller's
+   * own possibly-stale `observedState` the way the non-atomic fallback does.
+   *
+   * If omitted, the breaker falls back to an unconditional non-atomic
+   * get-then-set with no version bump and no published event — correctness
+   * is unaffected (the caller's own `observedState` check still guards the
+   * write), but other instances relying on `subscribeTransitions` won't
+   * observe this particular close.
+   */
+  closeAtomic?(key: string, eventsKey: string, opts: { ttlSeconds: number; operation: string }): Promise<CircuitBreakerState>;
+
+  /**
+   * Atomically reopens `key` after a failed half-open trial: `isOpen: true`,
+   * `openCount + 1`, `failures` raised to at least `failureThreshold`,
+   * `lastFailure: now`. Bumps `version` and publishes a transition event to
+   * `eventsKey`.
+   *
+   * If omitted, the breaker falls back to a non-atomic get-then-set with no
+   * version bump and no published event.
+   */
+  reopenTrialFailureAtomic?(
+    key: string,
+    eventsKey: string,
+    opts: { ttlSeconds: number; failureThreshold: number; now: number; operation: string },
+  ): Promise<CircuitBreakerState>;
+
+  /**
+   * Subscribes to the shared transition-event stream at `eventsKey` — one
+   * stream per store/prefix, carrying every state change any instance
+   * writes via `recordFailureAtomic`, `recordOutcomeAtomic`,
+   * `closeAtomic`, or `reopenTrialFailureAtomic` (never on a plain
+   * counter/EWMA update that doesn't flip `isOpen` or clear state). Used to
+   * invalidate the optional closed-state local cache (`localCache`)
+   * push-style instead of polling.
+   *
+   * `handler` is called once per delivered event, and with `null` whenever
+   * the subscription's underlying connection drops or errors — callers
+   * must treat `null` as "distrust every locally cached entry until it's
+   * been re-verified by a real read," since events may have been missed
+   * during the gap. Implementations should retry the underlying
+   * subscription with backoff after such a drop; callers are not expected
+   * to re-subscribe themselves.
+   *
+   * Returns an unsubscribe function that tears down the subscription.
+   * Implementations needing a dedicated (e.g. blocking) connection should
+   * establish it lazily on first call.
+   *
+   * If omitted, the breaker logs a one-time warning and `localCache` stays
+   * disabled entirely — behavior is then identical to not setting
+   * `localCache` at all (the open-state cache from a prior release, if
+   * configured, is unaffected).
+   */
+  subscribeTransitions?(eventsKey: string, handler: (event: TransitionEvent | null) => void): Promise<() => void>;
 }

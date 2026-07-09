@@ -1,6 +1,9 @@
 import { Redis } from 'ioredis';
 import { RedisStore } from '../src/stores/redis-store';
 import { CircuitBreaker } from '../src/circuit-breaker';
+import { TransitionEvent } from '../src/types';
+
+const EVENTS_KEY = 'circuit_breaker:events';
 
 /**
  * Runs against a real Redis instance (see docker-compose.yml: `docker compose
@@ -63,15 +66,15 @@ describe('RedisStore (integration)', () => {
 
   describe('recordFailureAtomic', () => {
     it('increments failures and opens once the threshold is reached', async () => {
-      const first = await store.recordFailureAtomic('op', { ttlSeconds: 30, failureThreshold: 3, now: Date.now() });
+      const first = await store.recordFailureAtomic('op', { ttlSeconds: 30, failureThreshold: 3, now: Date.now(), operation: 'op' });
       expect(first.failures).toBe(1);
       expect(first.isOpen).toBe(false);
 
-      const second = await store.recordFailureAtomic('op', { ttlSeconds: 30, failureThreshold: 3, now: Date.now() });
+      const second = await store.recordFailureAtomic('op', { ttlSeconds: 30, failureThreshold: 3, now: Date.now(), operation: 'op' });
       expect(second.failures).toBe(2);
       expect(second.isOpen).toBe(false);
 
-      const third = await store.recordFailureAtomic('op', { ttlSeconds: 30, failureThreshold: 3, now: Date.now() });
+      const third = await store.recordFailureAtomic('op', { ttlSeconds: 30, failureThreshold: 3, now: Date.now(), operation: 'op' });
       expect(third.failures).toBe(3);
       expect(third.isOpen).toBe(true);
     });
@@ -79,7 +82,7 @@ describe('RedisStore (integration)', () => {
     it('does not lose increments under concurrent callers (the reason this needs to be atomic)', async () => {
       await Promise.all(
         Array.from({ length: 25 }, () =>
-          store.recordFailureAtomic('op', { ttlSeconds: 30, failureThreshold: 1000, now: Date.now() }),
+          store.recordFailureAtomic('op', { ttlSeconds: 30, failureThreshold: 1000, now: Date.now(), operation: 'op' }),
         ),
       );
 
@@ -90,7 +93,7 @@ describe('RedisStore (integration)', () => {
 
   describe('recordOutcomeAtomic', () => {
     it('folds outcomes into an EWMA error rate and reports openedNow exactly once', async () => {
-      const opts = { decay: 0.5, minimumCalls: 2, errorRateThreshold: 0.5, ttlSeconds: 30, now: Date.now() };
+      const opts = { decay: 0.5, minimumCalls: 2, errorRateThreshold: 0.5, ttlSeconds: 30, now: Date.now(), operation: 'op' };
 
       const r1 = await store.recordOutcomeAtomic('op', { ...opts, success: false });
       expect(r1.isOpen).toBe(false);
@@ -138,6 +141,98 @@ describe('RedisStore (integration)', () => {
       await store.releaseTrial('op:trial', staleToken as string);
 
       await expect(store.claimTrial('op:trial', 30)).resolves.toBeNull(); // still held by freshToken
+    });
+  });
+
+  describe('closeAtomic', () => {
+    it('is a genuine no-op (no write, version stays implicit 0) when the state was already clean', async () => {
+      const prior = await store.closeAtomic('op', EVENTS_KEY, { ttlSeconds: 30, operation: 'op' });
+      expect(prior.isOpen).toBe(false);
+      expect(prior.version).toBe(0);
+      await expect(store.get('op')).resolves.toBeNull(); // nothing was ever written
+    });
+
+    it('writes CLOSED_STATE with a bumped version and publishes a transition when there was real state to clear', async () => {
+      await store.recordFailureAtomic('op', { ttlSeconds: 30, failureThreshold: 5, now: Date.now(), operation: 'op' });
+
+      const closed = await store.closeAtomic('op', EVENTS_KEY, { ttlSeconds: 30, operation: 'op' });
+      expect(closed).toMatchObject({ isOpen: false, failures: 0, version: 1 });
+
+      const entries = await redis.xrange('redeye-test:' + EVENTS_KEY, '-', '+');
+      expect(entries).toHaveLength(1);
+    });
+  });
+
+  describe('reopenTrialFailureAtomic', () => {
+    it('reopens with a bumped openCount/version, floors failures at the threshold, and publishes a transition each time', async () => {
+      const first = await store.reopenTrialFailureAtomic('op', EVENTS_KEY, {
+        ttlSeconds: 30,
+        failureThreshold: 5,
+        now: Date.now(),
+        operation: 'op',
+      });
+      expect(first).toMatchObject({ isOpen: true, openCount: 1, failures: 5, version: 1 });
+
+      const second = await store.reopenTrialFailureAtomic('op', EVENTS_KEY, {
+        ttlSeconds: 30,
+        failureThreshold: 5,
+        now: Date.now(),
+        operation: 'op',
+      });
+      expect(second).toMatchObject({ openCount: 2, version: 2 });
+
+      const entries = await redis.xrange('redeye-test:' + EVENTS_KEY, '-', '+');
+      expect(entries).toHaveLength(2);
+    });
+  });
+
+  describe('subscribeTransitions', () => {
+    it('delivers a decoded event for each published transition, and not for a plain sub-threshold failure increment', async () => {
+      const events: TransitionEvent[] = [];
+      const unsubscribe = await store.subscribeTransitions(EVENTS_KEY, (event) => {
+        if (event) events.push(event);
+      });
+
+      // Sub-threshold: no isOpen flip, so no transition should be published.
+      await store.recordFailureAtomic('op', { ttlSeconds: 30, failureThreshold: 5, now: Date.now(), operation: 'op' });
+      // Crosses the threshold: a real transition.
+      for (let i = 0; i < 4; i++) {
+        await store.recordFailureAtomic('op', { ttlSeconds: 30, failureThreshold: 5, now: Date.now(), operation: 'op' });
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, 200)); // let the blocking XREAD pick it up
+
+      expect(events).toHaveLength(1);
+      expect(events[0]).toMatchObject({ operation: 'op', isOpen: true, version: 1 });
+
+      await unsubscribe();
+    });
+
+    it('invokes the handler with null and keeps delivering after the underlying connection is killed and reconnects', async () => {
+      const events: (TransitionEvent | null)[] = [];
+      const unsubscribe = await store.subscribeTransitions(EVENTS_KEY, (event) => {
+        events.push(event);
+      });
+
+      await new Promise((resolve) => setTimeout(resolve, 100)); // let CLIENT SETNAME land
+
+      const list = (await redis.client('LIST')) as unknown as string;
+      const subscriberLine = list.split('\n').find((line) => line.includes('name=redeye-subscriber'));
+      const idMatch = subscriberLine?.match(/id=(\d+)/);
+      expect(idMatch).toBeTruthy();
+      await redis.client('KILL', 'ID', idMatch![1]);
+
+      // The read loop's next XREAD fails, delivering a null "distrust
+      // everything" signal, then retries with backoff and reconnects.
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+      expect(events).toContain(null);
+
+      // Once reconnected, a fresh transition is still delivered.
+      await store.recordFailureAtomic('op', { ttlSeconds: 30, failureThreshold: 1, now: Date.now(), operation: 'op' });
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      expect(events.some((e) => e && e.operation === 'op')).toBe(true);
+
+      await unsubscribe();
     });
   });
 });
@@ -241,5 +336,103 @@ describe('CircuitBreaker + RedisStore (integration)', () => {
 
     breakerA.destroy();
     breakerB.destroy();
+  });
+});
+
+describe('CircuitBreaker + RedisStore, localCache (integration)', () => {
+  let redis: Redis;
+  let store: RedisStore;
+
+  beforeAll(async () => {
+    redis = new Redis(REDIS_URL, { maxRetriesPerRequest: 1, lazyConnect: true });
+    await redis.connect();
+  });
+
+  afterAll(async () => {
+    await redis.quit();
+  });
+
+  beforeEach(async () => {
+    await redis.flushdb();
+    store = new RedisStore(redis, { keyPrefix: 'redeye-test:' });
+  });
+
+  it('propagates a trip from breaker A to breaker B within staleToleranceMs plus a generous delivery bound', async () => {
+    const opts = { failureThreshold: 1, resetTimeout: 60000, store, localCache: { staleToleranceMs: 100 } };
+    const breakerA = new CircuitBreaker(opts);
+    const breakerB = new CircuitBreaker(opts);
+
+    await breakerB.execute('op', succeed); // warms B's closed-state cache and its subscriber connection
+    await new Promise((resolve) => setTimeout(resolve, 150)); // let the subscription actually establish
+
+    const start = Date.now();
+    await expect(breakerA.execute('op', fail)).rejects.toThrow('boom'); // trips it
+
+    let elapsed = 0;
+    for (;;) {
+      elapsed = Date.now() - start;
+      try {
+        await expect(breakerB.execute('op', succeed)).rejects.toThrow('Circuit breaker is open for operation: op');
+        break;
+      } catch {
+        if (elapsed > 250) throw new Error(`breaker B did not observe the trip within 250ms (waited ${elapsed}ms)`);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    }
+    expect(elapsed).toBeLessThan(250); // staleToleranceMs (100) + a generous delivery bound
+
+    breakerA.destroy();
+    breakerB.destroy();
+  });
+
+  it('B still catches the trip within its poll interval after its subscriber connection is killed', async () => {
+    const breakerA = new CircuitBreaker({ failureThreshold: 1, resetTimeout: 60000, store, localCache: { staleToleranceMs: 100 } });
+    const breakerB = new CircuitBreaker({
+      failureThreshold: 1,
+      resetTimeout: 60000,
+      store,
+      localCache: { staleToleranceMs: 100 },
+      monitorInterval: 1000,
+    });
+
+    await breakerB.execute('op', succeed); // warms B's cache and its subscriber connection
+    await new Promise((resolve) => setTimeout(resolve, 150));
+
+    const list = (await redis.client('LIST')) as unknown as string;
+    const subscriberLine = list.split('\n').find((line) => line.includes('name=redeye-subscriber'));
+    const idMatch = subscriberLine?.match(/id=(\d+)/);
+    expect(idMatch).toBeTruthy(); // if this fails, the subscriber never connected -- not a reconnect-behavior failure
+    await redis.client('KILL', 'ID', idMatch![1]);
+
+    await expect(breakerA.execute('op', fail)).rejects.toThrow('boom'); // trips it while B's subscriber is down
+
+    await new Promise((resolve) => setTimeout(resolve, 1500)); // past B's 1s poll interval
+
+    await expect(breakerB.execute('op', succeed)).rejects.toThrow('Circuit breaker is open for operation: op');
+
+    breakerA.destroy();
+    breakerB.destroy();
+  });
+
+  it('XTRIM keeps the shared events stream bounded across more than 1,000 transitions', async () => {
+    const breaker = new CircuitBreaker({ failureThreshold: 1, resetTimeout: 1, jitter: 0, store });
+
+    // Each operation flips isOpen exactly twice per iteration (open, then
+    // close on the next successful trial), so this produces > 1,000
+    // transitions -- and therefore > 1,000 XADDs -- across a modest number
+    // of iterations and distinct operation names, without waiting on
+    // resetTimeout in real time (it's 1ms).
+    for (let i = 0; i < 600; i++) {
+      const op = `op-${i % 20}`;
+      await expect(breaker.execute(op, fail)).rejects.toThrow();
+      await new Promise((resolve) => setTimeout(resolve, 2));
+      await expect(breaker.execute(op, succeed)).resolves.toBe('ok');
+    }
+
+    const length = await redis.xlen('redeye-test:' + EVENTS_KEY);
+    expect(length).toBeLessThanOrEqual(1100); // MAXLEN ~ 1000, approximate trim allows some slack
+    expect(length).toBeGreaterThan(0);
+
+    breaker.destroy();
   });
 });

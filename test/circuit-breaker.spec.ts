@@ -1,6 +1,6 @@
 import { CircuitBreaker, StoreUnavailableError } from '../src/circuit-breaker';
 import { Store } from '../src/store';
-import { CircuitBreakerState } from '../src/types';
+import { CircuitBreakerState, TransitionEvent } from '../src/types';
 
 class InMemoryStore implements Store {
   private data = new Map<string, unknown>();
@@ -157,6 +157,179 @@ class ClaimOnlyStore implements Store {
   }
 }
 
+/**
+ * Implements every atomic capability including the Release-3 trio
+ * (`closeAtomic`, `reopenTrialFailureAtomic`, `subscribeTransitions`), with
+ * real version bumping and transition publishing mirroring the actual Lua
+ * scripts: version increments (and a transition is published) only when a
+ * write flips `isOpen`, or (for `closeAtomic`) clears real accumulated
+ * state. `subscribeTransitions` is single-subscriber and exposes two
+ * test-only controls: `simulateRemoteTransition` (an event arriving from
+ * another instance, independent of this store's own local data) and
+ * `simulateSubscriptionDrop` (the handler-visible `null` signal).
+ */
+class VersionedAtomicStore implements Store {
+  private data = new Map<string, CircuitBreakerState>();
+  private trialData = new Map<string, string>();
+  private handler: ((event: TransitionEvent | null) => void) | null = null;
+
+  async get<T>(key: string): Promise<T | null> {
+    return (this.data.get(key) as unknown as T) ?? null;
+  }
+
+  async set<T>(key: string, value: T): Promise<void> {
+    this.data.set(key, value as unknown as CircuitBreakerState);
+  }
+
+  async del(key: string): Promise<void> {
+    this.data.delete(key);
+  }
+
+  private notify(event: TransitionEvent): void {
+    this.handler?.(event);
+  }
+
+  async recordFailureAtomic(
+    key: string,
+    opts: { ttlSeconds: number; failureThreshold: number; now: number; operation: string },
+  ): Promise<CircuitBreakerState> {
+    const current = this.data.get(key);
+    const wasOpen = current?.isOpen ?? false;
+    const failures = (current?.failures ?? 0) + 1;
+    const isOpen = failures >= opts.failureThreshold;
+    let version = current?.version ?? 0;
+    if (isOpen !== wasOpen) version++;
+    const next: CircuitBreakerState = {
+      failures,
+      lastFailure: opts.now,
+      isOpen,
+      openCount: current?.openCount ?? 0,
+      errorRate: current?.errorRate ?? 0,
+      sampleCount: current?.sampleCount ?? 0,
+      version,
+    };
+    this.data.set(key, next);
+    if (isOpen !== wasOpen) {
+      this.notify({ operation: opts.operation, version, isOpen, lastFailure: next.lastFailure, openCount: next.openCount });
+    }
+    return next;
+  }
+
+  async recordOutcomeAtomic(
+    key: string,
+    opts: {
+      success: boolean;
+      decay: number;
+      minimumCalls: number;
+      errorRateThreshold: number;
+      now: number;
+      operation: string;
+    },
+  ): Promise<CircuitBreakerState & { openedNow: boolean }> {
+    const current = this.data.get(key);
+    const wasOpen = current?.isOpen ?? false;
+    const errorRate = (current?.errorRate ?? 0) * opts.decay + (opts.success ? 0 : 1) * (1 - opts.decay);
+    const sampleCount = (current?.sampleCount ?? 0) + 1;
+    const isOpen = sampleCount >= opts.minimumCalls && errorRate >= opts.errorRateThreshold;
+    let version = current?.version ?? 0;
+    if (isOpen !== wasOpen) version++;
+    const next: CircuitBreakerState = {
+      failures: current?.failures ?? 0,
+      lastFailure: opts.now,
+      isOpen,
+      openCount: current?.openCount ?? 0,
+      errorRate,
+      sampleCount,
+      version,
+    };
+    this.data.set(key, next);
+    if (isOpen !== wasOpen) {
+      this.notify({ operation: opts.operation, version, isOpen, lastFailure: next.lastFailure, openCount: next.openCount });
+    }
+    return { ...next, openedNow: isOpen && !wasOpen };
+  }
+
+  async claimTrial(key: string): Promise<string | null> {
+    if (this.trialData.has(key)) return null;
+    const token = `token-${Math.random().toString(36).slice(2)}`;
+    this.trialData.set(key, token);
+    return token;
+  }
+
+  async releaseTrial(key: string, token: string): Promise<void> {
+    if (this.trialData.get(key) === token) this.trialData.delete(key);
+  }
+
+  async closeAtomic(key: string, _eventsKey: string, opts: { ttlSeconds: number; operation: string }): Promise<CircuitBreakerState> {
+    const current = this.data.get(key);
+    const wasDirty = (current?.isOpen ?? false) || (current?.failures ?? 0) > 0;
+    if (!wasDirty) {
+      return current ?? { failures: 0, lastFailure: 0, isOpen: false, openCount: 0, errorRate: 0, sampleCount: 0, version: 0 };
+    }
+    const version = (current?.version ?? 0) + 1;
+    const next: CircuitBreakerState = { failures: 0, lastFailure: 0, isOpen: false, openCount: 0, errorRate: 0, sampleCount: 0, version };
+    this.data.set(key, next);
+    this.notify({ operation: opts.operation, version, isOpen: false, lastFailure: 0, openCount: 0 });
+    return next;
+  }
+
+  async reopenTrialFailureAtomic(
+    key: string,
+    _eventsKey: string,
+    opts: { ttlSeconds: number; failureThreshold: number; now: number; operation: string },
+  ): Promise<CircuitBreakerState> {
+    const current = this.data.get(key);
+    const openCount = (current?.openCount ?? 0) + 1;
+    const version = (current?.version ?? 0) + 1;
+    const next: CircuitBreakerState = {
+      failures: Math.max(current?.failures ?? 0, opts.failureThreshold),
+      lastFailure: opts.now,
+      isOpen: true,
+      openCount,
+      errorRate: current?.errorRate ?? 0,
+      sampleCount: current?.sampleCount ?? 0,
+      version,
+    };
+    this.data.set(key, next);
+    this.notify({ operation: opts.operation, version, isOpen: true, lastFailure: next.lastFailure, openCount });
+    return next;
+  }
+
+  async subscribeTransitions(_eventsKey: string, handler: (event: TransitionEvent | null) => void): Promise<() => void> {
+    this.handler = handler;
+    return async () => {
+      this.handler = null;
+    };
+  }
+
+  /** Test-only: simulates a transition event arriving from another instance via the shared stream, independent of this store's own local data. */
+  simulateRemoteTransition(event: TransitionEvent): void {
+    // A real transition event always corresponds to a write the remote
+    // instance also made to the same key (the XADD and the SET happen
+    // atomically in the same Lua script) -- keep this fake's underlying
+    // data consistent with what it publishes, so a gate that defers to a
+    // real read (rather than trusting the push notification alone) sees
+    // the same thing the event describes.
+    const key = `circuit_breaker:${event.operation}`;
+    const current = this.data.get(key);
+    this.data.set(key, {
+      failures: event.isOpen ? Math.max(current?.failures ?? 0, 1) : 0,
+      lastFailure: event.lastFailure,
+      isOpen: event.isOpen,
+      openCount: event.openCount,
+      errorRate: current?.errorRate ?? 0,
+      sampleCount: current?.sampleCount ?? 0,
+      version: event.version,
+    });
+    this.handler?.(event);
+  }
+
+  /** Test-only: simulates the subscription's underlying connection dropping. */
+  simulateSubscriptionDrop(): void {
+    this.handler?.(null);
+  }
+}
+
 class UnreachableStore implements Store {
   async get<T>(): Promise<T | null> {
     throw new Error('ECONNREFUSED');
@@ -171,6 +344,11 @@ class UnreachableStore implements Store {
 
 const fail = () => Promise.reject(new Error('boom'));
 const succeed = () => Promise.resolve('ok');
+
+/** Drains a few real microtask hops -- deliberately not setImmediate/setTimeout-based, so it works the same whether or not the calling test has jest.useFakeTimers() active (fake timers mock those, not the native Promise microtask queue). Enough hops for a couple of levels of internal async chaining (e.g. reconcileClosedCache -> safeGet -> store.get). */
+const flushMicrotasks = async () => {
+  for (let i = 0; i < 5; i++) await Promise.resolve();
+};
 
 describe('CircuitBreaker (local mode)', () => {
   it('opens after failureThreshold consecutive failures', async () => {
@@ -974,6 +1152,166 @@ describe('CircuitBreaker (distributed mode, open-state local cache)', () => {
 
     expect(breaker.canExecute('op')).toBe(false); // real, cached-open result
 
+    breaker.destroy();
+  });
+});
+
+describe('CircuitBreaker (distributed mode, closed-state local cache)', () => {
+  it('healthy consecutive path with a warm cache: N calls perform 0 reads and 0 writes', async () => {
+    const store = new VersionedAtomicStore();
+    const getSpy = jest.spyOn(store, 'get');
+    const closeSpy = jest.spyOn(store, 'closeAtomic');
+    const recordFailureSpy = jest.spyOn(store, 'recordFailureAtomic');
+    const breaker = new CircuitBreaker({ failureThreshold: 5, resetTimeout: 60000, store, localCache: { staleToleranceMs: 100 } });
+    await flushMicrotasks();
+
+    await expect(breaker.execute('op', succeed)).resolves.toBe('ok'); // warms the cache (1 real read, 0 writes -- already true from Release 1)
+
+    getSpy.mockClear();
+    closeSpy.mockClear();
+    recordFailureSpy.mockClear();
+
+    for (let i = 0; i < 10; i++) {
+      await expect(breaker.execute('op', succeed)).resolves.toBe('ok');
+    }
+
+    expect(getSpy).not.toHaveBeenCalled();
+    expect(closeSpy).not.toHaveBeenCalled();
+    expect(recordFailureSpy).not.toHaveBeenCalled();
+    breaker.destroy();
+  });
+
+  it('trip propagation: a remote transition event makes the very next call reject', async () => {
+    const store = new VersionedAtomicStore();
+    const breaker = new CircuitBreaker({ failureThreshold: 1, resetTimeout: 60000, jitter: 0, store, localCache: { staleToleranceMs: 100 } });
+    await flushMicrotasks();
+
+    await expect(breaker.execute('op', succeed)).resolves.toBe('ok'); // warms the cache: trusted, closed
+
+    store.simulateRemoteTransition({ operation: 'op', version: 1, isOpen: true, lastFailure: Date.now(), openCount: 0 });
+
+    await expect(breaker.execute('op', succeed)).rejects.toThrow('Circuit breaker is open for operation: op');
+    breaker.destroy();
+  });
+
+  it('bounds the fail-open window to staleToleranceMs, whether or not a transition is ever delivered', async () => {
+    jest.useFakeTimers();
+    try {
+      const store = new VersionedAtomicStore();
+      const breaker = new CircuitBreaker({
+        failureThreshold: 1,
+        resetTimeout: 60000,
+        jitter: 0,
+        store,
+        localCache: { staleToleranceMs: 100 },
+      });
+      await flushMicrotasks();
+
+      await expect(breaker.execute('op', succeed)).resolves.toBe('ok'); // warms the cache at t=0
+
+      // Another instance's trip lands on the real store, but the
+      // corresponding transition event is dropped -- never delivered.
+      await store.set('circuit_breaker:op', {
+        failures: 1,
+        lastFailure: Date.now(),
+        isOpen: true,
+        openCount: 0,
+        errorRate: 0,
+        sampleCount: 0,
+        version: 1,
+      });
+
+      // Still inside staleToleranceMs: the cache is fresh and trusted, so
+      // this call passes on now-stale information -- the documented,
+      // bounded fail-open window.
+      jest.advanceTimersByTime(50);
+      await expect(breaker.execute('op', succeed)).resolves.toBe('ok');
+
+      // Past staleToleranceMs: the cache no longer trusts itself on age
+      // alone, regardless of whether any transition event ever arrived.
+      jest.advanceTimersByTime(60);
+      await expect(breaker.execute('op', succeed)).rejects.toThrow('Circuit breaker is open for operation: op');
+
+      breaker.destroy();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('a version-less state (an older library version\'s write) is never trusted, so every call keeps reading', async () => {
+    const store = new VersionedAtomicStore();
+    const breaker = new CircuitBreaker({ failureThreshold: 5, resetTimeout: 60000, store, localCache: { staleToleranceMs: 100 } });
+    await flushMicrotasks();
+
+    // Simulate a state written by an older, pre-localCache library version: no `version` field at all.
+    await store.set('circuit_breaker:op', { failures: 0, lastFailure: 0, isOpen: false, openCount: 0, errorRate: 0, sampleCount: 0 });
+
+    const getSpy = jest.spyOn(store, 'get');
+    await expect(breaker.execute('op', succeed)).resolves.toBe('ok');
+    await expect(breaker.execute('op', succeed)).resolves.toBe('ok');
+    await expect(breaker.execute('op', succeed)).resolves.toBe('ok');
+
+    expect(getSpy).toHaveBeenCalledTimes(3); // never trusted -- every call performs a real read
+    breaker.destroy();
+  });
+
+  it('a missed transition message is reconciled by the fallback poll once the entry goes stale', async () => {
+    jest.useFakeTimers();
+    try {
+      const store = new VersionedAtomicStore();
+      const breaker = new CircuitBreaker({
+        failureThreshold: 1,
+        resetTimeout: 60000,
+        jitter: 0,
+        store,
+        localCache: { staleToleranceMs: 100 },
+        monitorInterval: 1000,
+      });
+      await flushMicrotasks();
+
+      await expect(breaker.execute('op', succeed)).resolves.toBe('ok'); // warms the cache at t=0
+
+      // A remote trip lands on the real store, but its transition event is dropped.
+      await store.set('circuit_breaker:op', {
+        failures: 1,
+        lastFailure: Date.now(),
+        isOpen: true,
+        openCount: 0,
+        errorRate: 0,
+        sampleCount: 0,
+        version: 1,
+      });
+
+      jest.advanceTimersByTime(50); // still fresh -- passes on stale info
+      await expect(breaker.execute('op', succeed)).resolves.toBe('ok');
+
+      // Past the poll-staleness bound (5s, hardcoded in monitor()) -- the
+      // fallback poll's own interval tick reconciles the entry via a real read.
+      jest.advanceTimersByTime(6000);
+      await flushMicrotasks();
+
+      await expect(breaker.execute('op', succeed)).rejects.toThrow('Circuit breaker is open for operation: op');
+      breaker.destroy();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('a subscription drop marks every cached entry untrusted, forcing the next calls to read authoritatively', async () => {
+    const store = new VersionedAtomicStore();
+    const breaker = new CircuitBreaker({ failureThreshold: 5, resetTimeout: 60000, store, localCache: { staleToleranceMs: 100 } });
+    await flushMicrotasks();
+
+    await expect(breaker.execute('op-a', succeed)).resolves.toBe('ok');
+    await expect(breaker.execute('op-b', succeed)).resolves.toBe('ok'); // both warmed, trusted
+
+    const getSpy = jest.spyOn(store, 'get');
+    store.simulateSubscriptionDrop();
+
+    await expect(breaker.execute('op-a', succeed)).resolves.toBe('ok');
+    await expect(breaker.execute('op-b', succeed)).resolves.toBe('ok');
+
+    expect(getSpy).toHaveBeenCalledTimes(2); // both entries untrusted -- both calls perform a real read
     breaker.destroy();
   });
 });

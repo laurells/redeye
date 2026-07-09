@@ -8,6 +8,31 @@ export interface CircuitBreakerState {
   errorRate: number;
   /** `errorRate` strategy only: number of calls folded into `errorRate` since the breaker last fully closed. */
   sampleCount: number;
+  /**
+   * Monotonic transition counter. Increments only when `isOpen` flips or a
+   * close clears accumulated state — never on a plain counter/EWMA update —
+   * so it identifies state *transitions*, not writes. Absent on states
+   * written by older library versions (pre-`localCache`) that don't know
+   * about it: treat absence as "unknown provenance, distrust any local
+   * cache of this key," never as version `0`. See README's local caching
+   * section for the mixed-fleet rolling-deploy behavior this enables.
+   */
+  version?: number;
+}
+
+/**
+ * A decoded entry from the store's shared transition stream (see
+ * `Store.subscribeTransitions`), published only when a write actually
+ * changes `isOpen` or clears accumulated state — not on every write.
+ * `null` is a distinct signal from the subscription itself (a dropped or
+ * reconnecting connection), not a decoded event; see `subscribeTransitions`.
+ */
+export interface TransitionEvent {
+  operation: string;
+  version: number;
+  isOpen: boolean;
+  lastFailure: number;
+  openCount: number;
 }
 
 export interface CircuitMetrics {
@@ -27,6 +52,7 @@ export const CLOSED_STATE: CircuitBreakerState = {
   openCount: 0,
   errorRate: 0,
   sampleCount: 0,
+  version: 0,
 };
 
 export const emptyMetrics = (): CircuitMetrics => ({
