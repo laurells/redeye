@@ -131,6 +131,16 @@ export interface Store {
    * Implementations needing a dedicated (e.g. blocking) connection should
    * establish it lazily on first call.
    *
+   * Must support more than one concurrent call on the same store instance:
+   * multiple `CircuitBreaker`s sharing one store (a natural thing to do)
+   * each call this independently with `localCache` set, and every one of
+   * them needs to actually receive events, not just the first to subscribe.
+   * `RedisStore` does this by fanning out one shared connection/read loop
+   * to every registered handler, tearing down only once the last one
+   * unsubscribes — implementations that instead throw or silently replace
+   * the previous subscription on a second call will leave every caller
+   * after the first with a permanently disabled `localCache`.
+   *
    * If omitted, the breaker logs a one-time warning and `localCache` stays
    * disabled entirely — behavior is then identical to not setting
    * `localCache` at all (the open-state cache from a prior release, if

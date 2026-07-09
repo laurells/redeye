@@ -306,7 +306,21 @@ function decodeTransitionEvent(fields: string[]): TransitionEvent | null {
  */
 export class RedisStore implements Store {
   private readonly prefix: string;
-  private subscriberConn: Redis | undefined;
+  /**
+   * At most one shared transition subscription per `RedisStore` instance,
+   * fanned out to every caller: multiple `CircuitBreaker`s sharing one
+   * `RedisStore` (a natural thing to do) each call `subscribeTransitions`
+   * independently, and all of them need to actually receive events instead
+   * of only the first one to subscribe. One duplicated connection and one
+   * read loop serve every registered handler; the loop and connection tear
+   * down only once the last handler unsubscribes.
+   */
+  private subscription?: {
+    eventsKey: string;
+    conn: Redis;
+    handlers: Set<(event: TransitionEvent | null) => void>;
+    stopped: boolean;
+  };
 
   constructor(private readonly redis: Redis, options: { keyPrefix?: string } = {}) {
     this.prefix = options.keyPrefix ?? '';
@@ -416,23 +430,43 @@ export class RedisStore implements Store {
    * Subscribes to the shared transition stream via a blocking `XREAD`, on a
    * lazily-created duplicated connection (`ioredis` requires a connection
    * dedicated to blocking commands — reusing the main client would stall
-   * every other command behind the block). Only one subscription per
-   * `RedisStore` instance is supported; call the returned unsubscribe
-   * function before subscribing again.
+   * every other command behind the block).
    *
-   * On a connection error, the handler is invoked once with `null` (see the
-   * `Store.subscribeTransitions` doc for what callers must do with that),
-   * and the read loop retries with a fixed backoff — callers never need to
-   * re-subscribe themselves.
+   * Fans out to every caller: multiple `CircuitBreaker`s sharing one
+   * `RedisStore` instance (a natural thing to do) each call this
+   * independently, and all of them need to actually receive events, not
+   * just the first to subscribe. The first call establishes the shared
+   * connection and read loop; later calls (for the same `eventsKey`) just
+   * register another handler on it. The connection and loop tear down only
+   * once every handler has unsubscribed. Subscribing again with a
+   * *different* `eventsKey` while one is already active throws — this
+   * store instance supports one shared events key at a time, which is the
+   * only way `CircuitBreaker` ever calls it in practice (its `eventsKey` is
+   * a fixed constant, not user-configurable).
+   *
+   * On a connection error, every registered handler is invoked once with
+   * `null` (see the `Store.subscribeTransitions` doc for what callers must
+   * do with that), and the read loop retries with a fixed backoff —
+   * callers never need to re-subscribe themselves.
    */
   async subscribeTransitions(eventsKey: string, handler: (event: TransitionEvent | null) => void): Promise<() => void> {
-    if (this.subscriberConn) {
-      throw new Error('RedisStore.subscribeTransitions: a subscription already exists on this instance; unsubscribe first.');
+    if (this.subscription) {
+      if (this.subscription.eventsKey !== eventsKey) {
+        throw new Error(
+          `RedisStore.subscribeTransitions: this store instance already has a subscription on a different eventsKey (${this.subscription.eventsKey}); only one events key is supported per instance at a time.`,
+        );
+      }
+      this.subscription.handlers.add(handler);
+      return this.makeUnsubscribe(handler);
     }
 
     const fullKey = this.prefix + eventsKey;
     const conn = this.redis.duplicate();
-    this.subscriberConn = conn;
+    const subscription = { eventsKey, conn, handlers: new Set([handler]), stopped: false };
+    this.subscription = subscription;
+    const dispatch = (event: TransitionEvent | null) => {
+      for (const h of subscription.handlers) h(event);
+    };
     // Named so an operator (or a test) can identify and target this specific
     // blocking connection via CLIENT LIST, distinct from the main client and
     // any other connection sharing the same Redis server -- e.g. to verify
@@ -441,7 +475,6 @@ export class RedisStore implements Store {
     // unnamed.
     conn.client('SETNAME', 'redeye-subscriber').catch(() => {});
 
-    let stopped = false;
     // '$' means "only entries added after this XREAD actually starts
     // blocking on the server" -- there's an inherent gap between this call
     // returning (the subscription is "set up" from the caller's
@@ -459,24 +492,25 @@ export class RedisStore implements Store {
     // reject its promise at all -- it can just resolve late once
     // reconnected. Catching only around `xread()` therefore isn't reliable
     // for detecting a drop; the connection's own error/close events are.
-    // `stopped` guards against firing on our *own* deliberate teardown.
+    // `subscription.stopped` guards against firing on our *own* deliberate
+    // teardown.
     conn.on('error', () => {
-      if (!stopped) handler(null);
+      if (!subscription.stopped) dispatch(null);
     });
     conn.on('close', () => {
-      if (!stopped) handler(null);
+      if (!subscription.stopped) dispatch(null);
     });
 
     const loop = async (): Promise<void> => {
-      while (!stopped) {
+      while (!subscription.stopped) {
         let result: [string, [string, string[]][]][] | null;
         try {
           result = (await conn.xread('BLOCK', 5000, 'STREAMS', fullKey, lastId)) as unknown as
             | [string, [string, string[]][]][]
             | null;
         } catch (error) {
-          if (stopped) break;
-          handler(null);
+          if (subscription.stopped) break;
+          dispatch(null);
           await new Promise((resolve) => setTimeout(resolve, 1000));
           continue;
         }
@@ -487,7 +521,7 @@ export class RedisStore implements Store {
           for (const [id, fields] of entries) {
             lastId = id;
             const event = decodeTransitionEvent(fields);
-            if (event) handler(event);
+            if (event) dispatch(event);
           }
         }
       }
@@ -495,16 +529,27 @@ export class RedisStore implements Store {
 
     void loop();
 
+    return this.makeUnsubscribe(handler);
+  }
+
+  /** Removes `handler` from the shared subscription, tearing the whole thing down once no handlers remain. Idempotent. */
+  private makeUnsubscribe(handler: (event: TransitionEvent | null) => void): () => Promise<void> {
+    let unsubscribed = false;
     return async () => {
-      if (stopped) return;
-      stopped = true;
-      this.subscriberConn = undefined;
-      // disconnect(), not quit(): quit() sends a command and waits for a
-      // reply, which can't happen promptly while this connection is
-      // (almost always) sitting inside a blocking XREAD -- Redis won't
-      // process it until the current BLOCK cycle ends on its own.
-      // disconnect() tears down the socket immediately.
-      conn.disconnect();
+      if (unsubscribed || !this.subscription) return;
+      unsubscribed = true;
+      this.subscription.handlers.delete(handler);
+      if (this.subscription.handlers.size === 0) {
+        const { conn } = this.subscription;
+        this.subscription.stopped = true;
+        this.subscription = undefined;
+        // disconnect(), not quit(): quit() sends a command and waits for a
+        // reply, which can't happen promptly while this connection is
+        // (almost always) sitting inside a blocking XREAD -- Redis won't
+        // process it until the current BLOCK cycle ends on its own.
+        // disconnect() tears down the socket immediately.
+        conn.disconnect();
+      }
     };
   }
 }

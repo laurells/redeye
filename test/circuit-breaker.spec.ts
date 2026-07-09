@@ -938,16 +938,21 @@ describe('CircuitBreaker (errorRate strategy)', () => {
 });
 
 describe('CircuitBreaker (dynamic operation name warnings)', () => {
-  it('warns once when an operation name contains a slash', async () => {
+  it('does not warn for a namespaced fixed operation name containing a slash', async () => {
+    // Deliberately not a trigger: this warning is one-time, so a false
+    // positive on '/' (a common, legitimate namespacing convention, e.g.
+    // "myapp/payment-gateway") would permanently consume the one warning
+    // this breaker ever gives, silencing it for a real leak introduced
+    // later. Length + maxOperations are the guards that actually catch a
+    // cardinality leak, regardless of what the names look like.
     const logger = { warn: jest.fn(), log: jest.fn() };
     const breaker = new CircuitBreaker({ failureThreshold: 5, resetTimeout: 60000, logger });
 
+    await breaker.execute('myapp/payment-gateway', succeed);
     await breaker.execute('/api/users/123', succeed);
-    await breaker.execute('/api/users/456', succeed);
 
     const dynamicNameWarnings = logger.warn.mock.calls.filter((call) => String(call[0]).includes('looks dynamic'));
-    expect(dynamicNameWarnings).toHaveLength(1);
-    expect(dynamicNameWarnings[0][0]).toContain('contains "/"');
+    expect(dynamicNameWarnings).toHaveLength(0);
     breaker.destroy();
   });
 
@@ -978,9 +983,10 @@ describe('CircuitBreaker (dynamic operation name warnings)', () => {
   it('warns once via recordFailure/recordSuccess too, not just execute', async () => {
     const logger = { warn: jest.fn(), log: jest.fn() };
     const breaker = new CircuitBreaker({ failureThreshold: 5, resetTimeout: 60000, logger });
+    const longName = 'x'.repeat(150);
 
-    breaker.recordFailure('/tenants/42/checkout');
-    breaker.recordSuccess('/tenants/42/checkout');
+    breaker.recordFailure(longName);
+    breaker.recordSuccess(longName);
 
     const dynamicNameWarnings = logger.warn.mock.calls.filter((call) => String(call[0]).includes('looks dynamic'));
     expect(dynamicNameWarnings).toHaveLength(1);
@@ -1205,6 +1211,29 @@ describe('CircuitBreaker (distributed mode, open-state local cache)', () => {
 });
 
 describe('CircuitBreaker (distributed mode, closed-state local cache)', () => {
+  it('isLocalCacheActive() reflects whether the subscription actually succeeded', async () => {
+    const withoutOption = new CircuitBreaker({ failureThreshold: 5, resetTimeout: 60000, store: new VersionedAtomicStore() });
+    expect(withoutOption.isLocalCacheActive()).toBe(false); // localCache never set
+    withoutOption.destroy();
+
+    const store = new VersionedAtomicStore();
+    const active = new CircuitBreaker({ failureThreshold: 5, resetTimeout: 60000, store, localCache: { staleToleranceMs: 100 } });
+    await flushMicrotasks();
+    expect(active.isLocalCacheActive()).toBe(true); // subscribeTransitions succeeded
+    active.destroy();
+
+    const noSubscribeStore = new AtomicInMemoryStore(); // implements atomics but not subscribeTransitions
+    const inactive = new CircuitBreaker({
+      failureThreshold: 5,
+      resetTimeout: 60000,
+      store: noSubscribeStore,
+      localCache: { staleToleranceMs: 100 },
+    });
+    await flushMicrotasks();
+    expect(inactive.isLocalCacheActive()).toBe(false); // store lacks the capability -- localCache is a no-op
+    inactive.destroy();
+  });
+
   it('healthy consecutive path with a warm cache: N calls perform 0 reads and 0 writes', async () => {
     const store = new VersionedAtomicStore();
     const getSpy = jest.spyOn(store, 'get');

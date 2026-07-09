@@ -463,6 +463,19 @@ export class CircuitBreaker {
     this.unsubscribeTransitions?.();
   }
 
+  /**
+   * Whether the closed-state local cache (`localCache`) is actually active
+   * right now — `false` if `localCache` was never set, if the store
+   * doesn't implement `subscribeTransitions`, or if the initial subscribe
+   * attempt itself failed. `setupLocalCache()` runs fire-and-forget from
+   * the constructor, so none of those cases throw; this is the way to
+   * confirm an opt-in feature actually opted in, from a health check or a
+   * startup assertion, without waiting on the one-time warning log.
+   */
+  isLocalCacheActive(): boolean {
+    return this.localCacheActive;
+  }
+
   async execute<T>(operation: string, fn: () => Promise<T>): Promise<T> {
     this.checkOperationName(operation);
     return this.distributed ? this.executeDistributed(operation, fn) : this.executeLocal(operation, fn);
@@ -476,13 +489,19 @@ export class CircuitBreaker {
    * call.
    */
   private checkOperationName(operation: string): void {
-    if (!this.warnedDynamicOperationName && (operation.length > 100 || operation.includes('/'))) {
+    // Deliberately length-only, not also a '/' check: this warning is
+    // one-time (see `warnedDynamicOperationName` below), so a false
+    // positive doesn't just annoy — it permanently consumes the one
+    // warning this breaker will ever give, silencing it for a genuine
+    // dynamic-name leak introduced later. '/' is too weak a signal to
+    // risk that on: a namespaced fixed name (e.g. "myapp/payment-gateway")
+    // is common and legitimate. `maxOperations` is the guard that actually
+    // catches a cardinality leak, regardless of what the names look like.
+    if (!this.warnedDynamicOperationName && operation.length > 100) {
       this.warnedDynamicOperationName = true;
-      const shown = operation.length > 100 ? `${operation.slice(0, 100)}…` : operation;
+      const shown = `${operation.slice(0, 100)}…`;
       this.options.logger.warn(
-        `Circuit breaker operation name "${shown}" looks dynamic (${
-          operation.length > 100 ? `${operation.length} chars` : 'contains "/"'
-        }). operation should be a small, fixed set of names (e.g. "payment-gateway"), not a value interpolated per request (a URL, tenant ID, user ID) — every distinct name is tracked forever and never evicted. See README.`,
+        `Circuit breaker operation name "${shown}" looks dynamic (${operation.length} chars). operation should be a small, fixed set of names (e.g. "payment-gateway"), not a value interpolated per request (a URL, tenant ID, user ID) — every distinct name is tracked forever and never evicted. See README.`,
       );
     }
 

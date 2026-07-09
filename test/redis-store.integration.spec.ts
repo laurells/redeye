@@ -242,6 +242,51 @@ describe('RedisStore (integration)', () => {
 
       await unsubscribe();
     });
+
+    it('fans out to multiple concurrent subscribers on the same store instance, and tears down only once all have unsubscribed', async () => {
+      const eventsA: TransitionEvent[] = [];
+      const eventsB: TransitionEvent[] = [];
+      const unsubscribeA = await store.subscribeTransitions(EVENTS_KEY, (event) => {
+        if (event) eventsA.push(event);
+      });
+      const unsubscribeB = await store.subscribeTransitions(EVENTS_KEY, (event) => {
+        if (event) eventsB.push(event);
+      });
+
+      // subscribeTransitions() resolves once the (shared) connection
+      // exists, not once its blocking XREAD is actually registered on the
+      // server -- writing immediately after can race ahead of it. Give it
+      // a moment to actually be listening before publishing (same as the
+      // single-subscriber test above).
+      await new Promise((resolve) => setTimeout(resolve, 300));
+
+      await store.recordFailureAtomic('op', { ttlSeconds: 30, failureThreshold: 1, now: Date.now(), operation: 'op' });
+      await new Promise((resolve) => setTimeout(resolve, 300));
+
+      // Both subscribers received it -- not just the first one to subscribe.
+      expect(eventsA).toHaveLength(1);
+      expect(eventsB).toHaveLength(1);
+      expect(eventsA[0]).toMatchObject({ operation: 'op', isOpen: true });
+      expect(eventsB[0]).toMatchObject({ operation: 'op', isOpen: true });
+
+      // Unsubscribing one leaves the other still receiving events -- the
+      // shared connection isn't torn down while any handler remains.
+      await unsubscribeA();
+      await store.closeAtomic('op', EVENTS_KEY, { ttlSeconds: 30, operation: 'op' });
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      expect(eventsA).toHaveLength(1); // no more events after unsubscribing
+      expect(eventsB).toHaveLength(2); // still subscribed, got the close too
+
+      await unsubscribeB();
+    });
+
+    it('throws when subscribing with a different eventsKey while a subscription is already active', async () => {
+      const unsubscribe = await store.subscribeTransitions(EVENTS_KEY, () => {});
+      await expect(store.subscribeTransitions('circuit_breaker:other-events', () => {})).rejects.toThrow(
+        /different eventsKey/,
+      );
+      await unsubscribe();
+    });
   });
 });
 
@@ -477,5 +522,33 @@ describe('CircuitBreaker + RedisStore, localCache (integration)', () => {
     await expect(breaker.execute('op', succeed)).resolves.toBe('ok');
 
     breaker.destroy();
+  });
+
+  it('two breakers sharing one RedisStore instance both get a working localCache, not just the first to subscribe', async () => {
+    const breakerA = new CircuitBreaker({ failureThreshold: 1, resetTimeout: 60000, jitter: 0, store, localCache: { staleToleranceMs: 100 } });
+    const breakerB = new CircuitBreaker({ failureThreshold: 1, resetTimeout: 60000, jitter: 0, store, localCache: { staleToleranceMs: 100 } });
+    await new Promise((resolve) => setTimeout(resolve, 150)); // let both subscriptions establish
+
+    expect(breakerA.isLocalCacheActive()).toBe(true);
+    expect(breakerB.isLocalCacheActive()).toBe(true); // not silently disabled for the second subscriber
+
+    // Both know about the same operation (metrics.has), so both accept a
+    // cache entry for it.
+    await expect(breakerA.execute('shared-op', succeed)).resolves.toBe('ok');
+    await expect(breakerB.execute('shared-op', succeed)).resolves.toBe('ok');
+
+    // A trips it; B never calls it again itself, so any knowledge B has of
+    // the trip can only have arrived via the shared transition
+    // subscription -- proving the fan-out actually delivers to the second
+    // registered handler, not just the first.
+    await expect(breakerA.execute('shared-op', fail)).rejects.toThrow('boom');
+    await new Promise((resolve) => setTimeout(resolve, 200)); // let the event propagate to B
+
+    const getSpy = jest.spyOn(store, 'get');
+    await expect(breakerB.execute('shared-op', succeed)).rejects.toThrow('Circuit breaker is open for operation: shared-op');
+    expect(getSpy).not.toHaveBeenCalled(); // rejected from B's own closed-cache entry, updated via the shared subscription
+
+    breakerA.destroy();
+    breakerB.destroy();
   });
 });
